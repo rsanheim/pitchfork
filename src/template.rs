@@ -108,17 +108,10 @@ impl TemplateContext {
             }
         }
 
-        let worktree_hash = daemon_config.path.as_deref().and_then(|p| {
-            crate::pitchfork_toml::worktree_hash_for_config_path(p).unwrap_or_else(|e| {
-                log::debug!("cannot resolve worktree hash for {}: {e}", p.display());
-                None
-            })
-        });
-
         Self {
             self_state,
             daemon_states,
-            worktree_hash,
+            worktree_hash: daemon_config.worktree_hash.clone(),
         }
     }
 

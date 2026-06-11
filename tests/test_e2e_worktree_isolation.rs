@@ -3,6 +3,7 @@ mod common;
 use common::TestEnv;
 use pitchfork_cli::pitchfork_toml;
 use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
 
 // ============================================================================
@@ -30,6 +31,47 @@ namespace_per_worktree = true
 run = "sh -c 'echo hello from checkout B && sleep 60'"
 "#;
 
+/// Start the `api` daemon from `dir`, asserting success.
+fn start_api(env: &TestEnv, dir: &PathBuf) {
+    let out = env.run_command_in_dir(&["start", "api"], dir);
+    assert!(
+        out.status.success(),
+        "start in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `stop -l` in `stop_in` stops its own `api` daemon and leaves the one in
+/// `must_survive` running.
+fn assert_stop_local_isolates(env: &TestEnv, stop_in: &PathBuf, must_survive: &PathBuf) {
+    let stop = env.run_command_in_dir(&["stop", "-l"], stop_in);
+    assert!(
+        stop.status.success(),
+        "stop -l in {} failed: {}",
+        stop_in.display(),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    env.sleep(Duration::from_secs(1));
+
+    let status = env.run_command_in_dir(&["status", "api"], stop_in);
+    let status_str = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(
+        status_str.contains("stopped") || status_str.contains("exited"),
+        "api in {} should be stopped after stop -l, got: {status_str}",
+        stop_in.display()
+    );
+
+    let status = env.run_command_in_dir(&["status", "api"], must_survive);
+    let status_str = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(
+        status_str.contains("running"),
+        "api in {} must keep running after stop -l in {}, got: {status_str}",
+        must_survive.display(),
+        stop_in.display()
+    );
+}
+
 /// Two checkouts with the same leaf dir name run the same daemon side by side
 /// under one supervisor, with separate namespaces and logs, and `stop -l`
 /// only stops the current checkout's daemon.
@@ -54,18 +96,8 @@ fn test_namespace_per_worktree_same_leaf_checkouts() {
     );
 
     // Start the same-named daemon from each checkout
-    let out_a = env.run_command_in_dir(&["start", "api"], &checkout_a);
-    assert!(
-        out_a.status.success(),
-        "start in A failed: {}",
-        String::from_utf8_lossy(&out_a.stderr)
-    );
-    let out_b = env.run_command_in_dir(&["start", "api"], &checkout_b);
-    assert!(
-        out_b.status.success(),
-        "start in B failed: {}",
-        String::from_utf8_lossy(&out_b.stderr)
-    );
+    start_api(&env, &checkout_a);
+    start_api(&env, &checkout_b);
 
     env.sleep(Duration::from_secs(1));
 
@@ -84,27 +116,7 @@ fn test_namespace_per_worktree_same_leaf_checkouts() {
     assert!(log_b.contains("hello from checkout B"), "got: {log_b}");
 
     // stop -l from checkout A only stops A's daemon
-    let stop_a = env.run_command_in_dir(&["stop", "-l"], &checkout_a);
-    assert!(
-        stop_a.status.success(),
-        "stop -l in A failed: {}",
-        String::from_utf8_lossy(&stop_a.stderr)
-    );
-    env.sleep(Duration::from_secs(1));
-
-    let status_a = env.run_command_in_dir(&["status", "api"], &checkout_a);
-    let status_a_str = String::from_utf8_lossy(&status_a.stdout).to_string();
-    assert!(
-        status_a_str.contains("stopped") || status_a_str.contains("exited"),
-        "A's api should be stopped after stop -l in A, got: {status_a_str}"
-    );
-
-    let status_b = env.run_command_in_dir(&["status", "api"], &checkout_b);
-    let status_b_str = String::from_utf8_lossy(&status_b.stdout).to_string();
-    assert!(
-        status_b_str.contains("running"),
-        "B's api must keep running after stop -l in A, got: {status_b_str}"
-    );
+    assert_stop_local_isolates(&env, &checkout_a, &checkout_b);
 
     // Cleanup
     let _ = env.run_command_in_dir(&["stop", "-l"], &checkout_b);
@@ -129,43 +141,13 @@ fn test_namespace_per_worktree_nested_worktree() {
     let ns_nested = pitchfork_toml::namespace_from_path(&nested.join("pitchfork.toml")).unwrap();
     assert_ne!(ns_root, ns_nested);
 
-    let out_root = env.run_command_in_dir(&["start", "api"], &root);
-    assert!(
-        out_root.status.success(),
-        "start in root failed: {}",
-        String::from_utf8_lossy(&out_root.stderr)
-    );
-    let out_nested = env.run_command_in_dir(&["start", "api"], &nested);
-    assert!(
-        out_nested.status.success(),
-        "start in nested worktree failed: {}",
-        String::from_utf8_lossy(&out_nested.stderr)
-    );
+    start_api(&env, &root);
+    start_api(&env, &nested);
 
     env.sleep(Duration::from_secs(1));
 
     // stop -l in the nested worktree must not stop the parent checkout's daemon
-    let stop_nested = env.run_command_in_dir(&["stop", "-l"], &nested);
-    assert!(
-        stop_nested.status.success(),
-        "stop -l in nested failed: {}",
-        String::from_utf8_lossy(&stop_nested.stderr)
-    );
-    env.sleep(Duration::from_secs(1));
-
-    let status_nested = env.run_command_in_dir(&["status", "api"], &nested);
-    let status_nested_str = String::from_utf8_lossy(&status_nested.stdout).to_string();
-    assert!(
-        status_nested_str.contains("stopped") || status_nested_str.contains("exited"),
-        "nested api should be stopped, got: {status_nested_str}"
-    );
-
-    let status_root = env.run_command_in_dir(&["status", "api"], &root);
-    let status_root_str = String::from_utf8_lossy(&status_root.stdout).to_string();
-    assert!(
-        status_root_str.contains("running"),
-        "root api must keep running after stop -l in nested worktree, got: {status_root_str}"
-    );
+    assert_stop_local_isolates(&env, &nested, &root);
 
     // Cleanup
     let _ = env.run_command_in_dir(&["stop", "-l"], &root);
@@ -205,13 +187,7 @@ fn test_namespace_per_worktree_templates() {
     assert_ne!(hash_a, hash_b);
 
     for checkout in [&checkout_a, &checkout_b] {
-        let out = env.run_command_in_dir(&["start", "api"], checkout);
-        assert!(
-            out.status.success(),
-            "start in {} failed: {}",
-            checkout.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        start_api(&env, checkout);
     }
 
     env.sleep(Duration::from_secs(1));
