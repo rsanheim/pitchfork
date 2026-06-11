@@ -278,8 +278,19 @@ impl IpcClient {
     /// This excludes daemons from global config files (~/.config/pitchfork/config.toml
     /// and /etc/pitchfork/config.toml), returning only daemons defined in project-level
     /// pitchfork.toml files.
+    ///
+    /// When the nearest config for the current directory has
+    /// `namespace_per_worktree` enabled, "local" narrows to exactly that
+    /// checkout's namespace, so a worktree nested inside another checkout
+    /// never touches its parent's daemons. Sibling config files are
+    /// guaranteed to agree on that namespace (divergent values are a parse
+    /// error), so the single-namespace filter is exhaustive.
     pub fn get_local_configured_daemons() -> Result<Vec<DaemonId>> {
-        Self::get_configured_daemons_filtered(|id| id.namespace() != "global")
+        if let Some(ns) = PitchforkToml::isolated_namespace_for_dir(&crate::env::CWD)? {
+            Self::get_configured_daemons_filtered(move |id| id.namespace() == ns)
+        } else {
+            Self::get_configured_daemons_filtered(|id| id.namespace() != "global")
+        }
     }
 
     /// Get global configured daemon IDs (from ~/.config/pitchfork/config.toml and /etc/pitchfork/config.toml)
@@ -350,6 +361,13 @@ impl IpcClient {
         ids: &[DaemonId],
         opts: StartOptions,
     ) -> Result<StartResult> {
+        // Make a per-worktree checkout discoverable by the supervisor, which
+        // re-resolves configs for hooks/file-watching/autostop via the global
+        // [namespaces] registry. Registration failure shouldn't block starts.
+        if let Err(e) = PitchforkToml::register_isolated_namespace_for_dir(&crate::env::CWD) {
+            warn!("failed to register per-worktree namespace: {e}");
+        }
+
         let pt = PitchforkToml::all_merged_all_namespaces()?;
         let disabled_daemons = self.get_disabled_daemons().await?;
 

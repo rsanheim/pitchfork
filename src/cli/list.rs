@@ -26,6 +26,7 @@ Example:
   pitchfork list
   pitchfork ls                    Alias for 'list'
   pitchfork list --hide-header    Output without column headers
+  pitchfork list --dirs           Include each daemon's directory
 
 Output:
   Name    PID    Status     Error
@@ -37,6 +38,10 @@ pub struct List {
     /// Hide the table header row
     #[clap(long)]
     hide_header: bool,
+    /// Show each daemon's directory (useful with namespace_per_worktree to
+    /// tell checkouts apart)
+    #[clap(long)]
+    dirs: bool,
 }
 
 impl List {
@@ -49,11 +54,15 @@ impl List {
             .load_preset(comfy_table::presets::NOTHING)
             .set_content_arrangement(ContentArrangement::Dynamic);
         if !self.hide_header && console::user_attended() {
-            if s.proxy.enable {
-                table.set_header(vec!["Name", "PID", "Status", "", "Proxy URL", "Error"]);
-            } else {
-                table.set_header(vec!["Name", "PID", "Status", "", "Error"]);
+            let mut header = vec!["Name", "PID", "Status", ""];
+            if self.dirs {
+                header.push("Dir");
             }
+            if s.proxy.enable {
+                header.push("Proxy URL");
+            }
+            header.push("Error");
+            table.set_header(header);
         }
 
         let entries = get_all_daemons(&client).await?;
@@ -98,6 +107,15 @@ impl List {
                 Cell::new(&status_text).fg(status_color),
                 Cell::new(disabled_marker),
             ];
+            if self.dirs {
+                let dir_str = entry
+                    .daemon
+                    .dir
+                    .as_deref()
+                    .map(display_dir)
+                    .unwrap_or_default();
+                row.push(Cell::new(dir_str));
+            }
             if s.proxy.enable {
                 let slug =
                     PitchforkToml::find_slug_for_daemon_in_registry(&entry.id, &global_slugs);
@@ -117,6 +135,14 @@ impl List {
         }
 
         print_table(table)
+    }
+}
+
+/// Render a daemon directory for display, contracting `$HOME` to `~`.
+fn display_dir(dir: &std::path::Path) -> String {
+    match dir.strip_prefix(&*crate::env::HOME_DIR) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
     }
 }
 

@@ -90,6 +90,25 @@ Notes:
 - If both declare `namespace`, the values must match
 - Global config files must use `global`
 
+### Top-level `namespace_per_worktree` (optional)
+
+Gives every checkout of the project (e.g. every git worktree) its own namespace by appending a stable hash of the checkout's canonical path to the explicit `namespace`, so multiple checkouts can run the same daemons side by side. See [Namespaces](/concepts/namespaces#per-worktree-namespaces) for details.
+
+```toml
+namespace = "myproj"
+namespace_per_worktree = true
+
+[daemons.api]
+run = "npm run dev"
+```
+
+Notes:
+
+- Requires an explicit `namespace` (the stable cross-checkout base)
+- Both keys may be set in any of the project's config files and apply to all of them; conflicting explicit values are an error
+- With the flag enabled, `start -l` / `stop -l` / `restart -l` narrow to exactly the current checkout's namespace
+- Not allowed in global config files
+
 ## Daemon Options
 
 ### `run` (required)

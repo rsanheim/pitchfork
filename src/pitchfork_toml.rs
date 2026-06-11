@@ -107,6 +107,8 @@ pub struct NamespaceEntry {
 struct PitchforkTomlRaw {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub namespace_per_worktree: Option<bool>,
     #[serde(default)]
     pub daemons: IndexMap<String, PitchforkTomlDaemonRaw>,
     #[serde(default)]
@@ -216,6 +218,15 @@ pub struct PitchforkToml {
     /// This applies to per-file read/write flows. Merged configs may contain
     /// daemons from multiple namespaces and leave this as `None`.
     pub namespace: Option<String>,
+    /// Opt-in per-worktree namespace isolation.
+    ///
+    /// When `true`, the namespace gains a stable suffix derived from the
+    /// project directory's canonical path, so every checkout (e.g. git
+    /// worktree) of the project gets its own isolated set of daemons even
+    /// when checkouts share the same leaf directory name. Requires an
+    /// explicit `namespace`; both keys may be declared in any of the
+    /// project's config files and apply to all of them.
+    pub namespace_per_worktree: Option<bool>,
     /// Settings configuration (merged from all config files).
     ///
     /// **Note:** This field exists for serialization round-trips and for
@@ -264,35 +275,248 @@ fn sibling_base_config(path: &Path) -> Option<PathBuf> {
     path.parent().map(|p| p.join("pitchfork.toml"))
 }
 
-fn parse_namespace_override_from_content(path: &Path, content: &str) -> Result<Option<String>> {
+/// Top-level identity keys (`namespace`, `namespace_per_worktree`) parsed from
+/// a config file without deserializing the full document.
+#[derive(Debug, Default, Clone)]
+struct TopLevelOverrides {
+    namespace: Option<String>,
+    namespace_per_worktree: Option<bool>,
+}
+
+fn parse_top_level_overrides(path: &Path, content: &str) -> Result<TopLevelOverrides> {
     use toml::Value;
 
     let doc: Value = toml::from_str(content)
         .map_err(|e| ConfigParseError::from_toml_error(path, content.to_string(), e))?;
-    let Some(value) = doc.get("namespace") else {
-        return Ok(None);
+
+    let namespace = match doc.get("namespace") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(value) => {
+            return Err(ConfigParseError::InvalidNamespace {
+                path: path.to_path_buf(),
+                namespace: value.to_string(),
+                reason: "top-level 'namespace' must be a string".to_string(),
+            }
+            .into());
+        }
     };
 
-    match value {
-        Value::String(s) => Ok(Some(s.clone())),
-        _ => Err(ConfigParseError::InvalidNamespace {
-            path: path.to_path_buf(),
-            namespace: value.to_string(),
-            reason: "top-level 'namespace' must be a string".to_string(),
+    let namespace_per_worktree = match doc.get("namespace_per_worktree") {
+        None => None,
+        Some(Value::Boolean(b)) => Some(*b),
+        Some(_) => {
+            return Err(ConfigParseError::InvalidNamespacePerWorktree {
+                path: path.to_path_buf(),
+                reason: "top-level 'namespace_per_worktree' must be a boolean".to_string(),
+            }
+            .into());
         }
-        .into()),
-    }
+    };
+
+    Ok(TopLevelOverrides {
+        namespace,
+        namespace_per_worktree,
+    })
 }
 
-fn read_namespace_override_from_file(path: &Path) -> Result<Option<String>> {
+fn read_top_level_overrides(path: &Path) -> Result<TopLevelOverrides> {
     if !path.exists() {
-        return Ok(None);
+        return Ok(TopLevelOverrides::default());
     }
     let content = std::fs::read_to_string(path).map_err(|e| FileError::ReadError {
         path: path.to_path_buf(),
         source: e,
     })?;
-    parse_namespace_override_from_content(path, &content)
+    parse_top_level_overrides(path, &content)
+}
+
+/// The project directory a config file belongs to (the parent dir, or the
+/// grandparent for `.config/pitchfork.toml` style configs).
+fn config_project_dir(path: &Path) -> Option<&Path> {
+    if is_dot_config_pitchfork(path) {
+        path.parent().and_then(|p| p.parent())
+    } else {
+        path.parent()
+    }
+}
+
+/// All config file paths that share a namespace with `path` (same project dir),
+/// including `path` itself.
+fn sibling_config_paths(path: &Path) -> Vec<PathBuf> {
+    let Some(dir) = config_project_dir(path) else {
+        return vec![path.to_path_buf()];
+    };
+    vec![
+        dir.join(".config/pitchfork.toml"),
+        dir.join(".config/pitchfork.local.toml"),
+        dir.join("pitchfork.toml"),
+        dir.join("pitchfork.local.toml"),
+    ]
+}
+
+/// Effective identity for a project config file: the explicit namespace (if
+/// any) and the per-worktree flag, resolved across sibling config files.
+#[derive(Debug)]
+struct EffectiveIdentity {
+    explicit_namespace: Option<String>,
+    namespace_per_worktree: bool,
+}
+
+/// Resolve the effective identity keys for a project config file.
+///
+/// `namespace_per_worktree` is a property of the project directory: it may be
+/// set in any of the sibling config files (`pitchfork.toml`,
+/// `pitchfork.local.toml`, or their `.config/` variants) and applies to all of
+/// them, so sibling files always resolve to the same namespace. Conflicting
+/// explicit values are an error.
+///
+/// When the flag is enabled, the explicit `namespace` is resolved the same
+/// way — any sibling may declare it and all declarations must agree — so the
+/// flag can live in an untracked `pitchfork.local.toml` while the namespace
+/// stays in the committed config. When the flag is off, the existing
+/// semantics apply: a file's namespace comes from the file itself, or from
+/// its base `pitchfork.toml` for `*.local.toml` files (which must match).
+///
+/// `self_overrides` supplies the values for `path` itself when its content is
+/// already in memory (and possibly unsaved); pass `None` to read from disk.
+fn effective_identity(
+    path: &Path,
+    self_overrides: Option<&TopLevelOverrides>,
+) -> Result<EffectiveIdentity> {
+    let read_self = |p: &Path| -> Result<TopLevelOverrides> {
+        match self_overrides {
+            Some(o) => Ok(o.clone()),
+            None => read_top_level_overrides(p),
+        }
+    };
+
+    let mut entries: Vec<(PathBuf, TopLevelOverrides)> = Vec::new();
+    let mut self_seen = false;
+    for sibling in sibling_config_paths(path) {
+        let overrides = if sibling == path {
+            self_seen = true;
+            read_self(&sibling)?
+        } else {
+            read_top_level_overrides(&sibling)?
+        };
+        entries.push((sibling, overrides));
+    }
+    if !self_seen {
+        // `path` has a non-standard name; make sure its own (possibly
+        // in-memory) values still participate.
+        entries.push((path.to_path_buf(), read_self(path)?));
+    }
+
+    let flags: Vec<(&Path, bool)> = entries
+        .iter()
+        .filter_map(|(p, o)| o.namespace_per_worktree.map(|v| (p.as_path(), v)))
+        .collect();
+    if let (Some((path_a, _)), Some((path_b, _))) = (
+        flags.iter().find(|(_, v)| *v),
+        flags.iter().find(|(_, v)| !*v),
+    ) {
+        return Err(ConfigParseError::InvalidNamespacePerWorktree {
+            path: path.to_path_buf(),
+            reason: format!(
+                "conflicting namespace_per_worktree values: {} sets true but {} sets false",
+                path_a.display(),
+                path_b.display()
+            ),
+        }
+        .into());
+    }
+    let namespace_per_worktree = flags.iter().any(|(_, v)| *v);
+
+    let explicit_namespace = if namespace_per_worktree {
+        // The namespace is a project-dir property too: any sibling may
+        // declare it, and all declarations must agree, so every sibling
+        // resolves to the same per-worktree namespace.
+        let namespaces: Vec<(&Path, &str)> = entries
+            .iter()
+            .filter_map(|(p, o)| o.namespace.as_deref().map(|v| (p.as_path(), v)))
+            .collect();
+        if let Some((first_path, first_ns)) = namespaces.first()
+            && let Some((other_path, other_ns)) = namespaces.iter().find(|(_, ns)| ns != first_ns)
+        {
+            return Err(ConfigParseError::InvalidNamespace {
+                path: path.to_path_buf(),
+                namespace: other_ns.to_string(),
+                reason: format!(
+                    "conflicting namespace values with namespace_per_worktree enabled: {} sets '{first_ns}' but {} sets '{other_ns}'",
+                    first_path.display(),
+                    other_path.display()
+                ),
+            }
+            .into());
+        }
+        namespaces.first().map(|(_, ns)| ns.to_string())
+    } else {
+        let own = entries
+            .iter()
+            .find(|(p, _)| p.as_path() == path)
+            .and_then(|(_, o)| o.namespace.clone());
+        let base = sibling_base_config(path).and_then(|bp| {
+            entries
+                .iter()
+                .find(|(p, _)| *p == bp)
+                .and_then(|(_, o)| o.namespace.clone())
+        });
+
+        if let (Some(local_ns), Some(base_ns)) = (own.as_deref(), base.as_deref())
+            && local_ns != base_ns
+        {
+            return Err(ConfigParseError::InvalidNamespace {
+                path: path.to_path_buf(),
+                namespace: local_ns.to_string(),
+                reason: format!(
+                    "namespace '{local_ns}' does not match sibling pitchfork.toml namespace '{base_ns}'"
+                ),
+            }
+            .into());
+        }
+        own.or(base)
+    };
+
+    Ok(EffectiveIdentity {
+        explicit_namespace,
+        namespace_per_worktree,
+    })
+}
+
+/// Stable 8-hex-char suffix for a project directory, derived from its
+/// canonical path with FNV-1a (64-bit). Implemented inline so the value never
+/// changes across pitchfork or Rust releases — daemon identity depends on it.
+fn worktree_hash_suffix(dir: &Path) -> String {
+    let canonical = dir.canonicalize().unwrap_or_else(|e| {
+        if dir.exists() {
+            warn!(
+                "cannot canonicalize {} for per-worktree namespace hash: {e}; using the literal path",
+                dir.display()
+            );
+        }
+        dir.to_path_buf()
+    });
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", hash >> 32)
+}
+
+/// The per-worktree hash suffix for a config file's project directory, when
+/// the project has `namespace_per_worktree` enabled. `None` otherwise
+/// (including for global config files).
+pub fn worktree_hash_for_config_path(path: &Path) -> Result<Option<String>> {
+    if is_global_config(path) {
+        return Ok(None);
+    }
+    let identity = effective_identity(path, None)?;
+    if !identity.namespace_per_worktree {
+        return Ok(None);
+    }
+    Ok(config_project_dir(path).map(worktree_hash_suffix))
 }
 
 fn validate_namespace(path: &Path, namespace: &str) -> Result<String> {
@@ -308,13 +532,7 @@ fn validate_namespace(path: &Path, namespace: &str) -> Result<String> {
 }
 
 fn derive_namespace_from_dir(path: &Path) -> Result<String> {
-    let dir_for_namespace = if is_dot_config_pitchfork(path) {
-        path.parent().and_then(|p| p.parent())
-    } else {
-        path.parent()
-    };
-
-    let raw_namespace = dir_for_namespace
+    let raw_namespace = config_project_dir(path)
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .ok_or_else(|| miette::miette!("cannot derive namespace from path '{}'", path.display()))?
@@ -332,8 +550,20 @@ fn derive_namespace_from_dir(path: &Path) -> Result<String> {
     })
 }
 
-fn namespace_from_path_with_override(path: &Path, explicit: Option<&str>) -> Result<String> {
+fn namespace_from_path_with_override(
+    path: &Path,
+    explicit: Option<&str>,
+    namespace_per_worktree: bool,
+) -> Result<String> {
     if is_global_config(path) {
+        if namespace_per_worktree {
+            return Err(ConfigParseError::InvalidNamespacePerWorktree {
+                path: path.to_path_buf(),
+                reason: "namespace_per_worktree is not supported in global config files"
+                    .to_string(),
+            }
+            .into());
+        }
         if let Some(ns) = explicit
             && ns != "global"
         {
@@ -347,36 +577,68 @@ fn namespace_from_path_with_override(path: &Path, explicit: Option<&str>) -> Res
         return Ok("global".to_string());
     }
 
-    if let Some(ns) = explicit {
-        return validate_namespace(path, ns);
+    let base = match explicit {
+        Some(ns) => validate_namespace(path, ns)?,
+        None => {
+            if namespace_per_worktree {
+                return Err(ConfigParseError::InvalidNamespacePerWorktree {
+                    path: path.to_path_buf(),
+                    reason: "namespace_per_worktree = true requires an explicit namespace; set namespace = \"...\" in any of the project's config files".to_string(),
+                }
+                .into());
+            }
+            derive_namespace_from_dir(path)?
+        }
+    };
+
+    if !namespace_per_worktree {
+        return Ok(base);
     }
 
-    derive_namespace_from_dir(path)
+    let project_dir = config_project_dir(path).ok_or_else(|| {
+        miette::miette!(
+            "cannot derive per-worktree namespace from path '{}'",
+            path.display()
+        )
+    })?;
+    let namespace = format!("{base}-{}", worktree_hash_suffix(project_dir));
+    validate_namespace(path, &namespace)
+}
+
+/// Resolve the namespace for a config file, honoring the identity keys
+/// (`namespace`, `namespace_per_worktree`) across sibling config files.
+///
+/// `self_overrides` supplies the top-level keys for `path` itself when its
+/// content is already in memory (and possibly unsaved); pass `None` to read
+/// from disk.
+fn resolve_config_namespace(
+    path: &Path,
+    self_overrides: Option<&TopLevelOverrides>,
+) -> Result<String> {
+    if is_global_config(path) {
+        // Don't scan project-style sibling paths next to the global config;
+        // only an explicit flag in the file itself matters (and is an error).
+        let own = match self_overrides {
+            Some(o) => o.clone(),
+            None => read_top_level_overrides(path)?,
+        };
+        return namespace_from_path_with_override(
+            path,
+            own.namespace.as_deref(),
+            own.namespace_per_worktree.unwrap_or(false),
+        );
+    }
+
+    let identity = effective_identity(path, self_overrides)?;
+    namespace_from_path_with_override(
+        path,
+        identity.explicit_namespace.as_deref(),
+        identity.namespace_per_worktree,
+    )
 }
 
 fn namespace_from_file(path: &Path) -> Result<String> {
-    let explicit = read_namespace_override_from_file(path)?;
-    let base_explicit = sibling_base_config(path)
-        .and_then(|p| if p.exists() { Some(p) } else { None })
-        .map(|p| read_namespace_override_from_file(&p))
-        .transpose()?
-        .flatten();
-
-    if let (Some(local_ns), Some(base_ns)) = (explicit.as_deref(), base_explicit.as_deref())
-        && local_ns != base_ns
-    {
-        return Err(ConfigParseError::InvalidNamespace {
-            path: path.to_path_buf(),
-            namespace: local_ns.to_string(),
-            reason: format!(
-                "namespace '{local_ns}' does not match sibling pitchfork.toml namespace '{base_ns}'"
-            ),
-        }
-        .into());
-    }
-
-    let effective_explicit = explicit.as_deref().or(base_explicit.as_deref());
-    namespace_from_path_with_override(path, effective_explicit)
+    resolve_config_namespace(path, None)
 }
 
 /// Extracts a namespace from a config file path.
@@ -627,6 +889,69 @@ impl PitchforkToml {
             .map(|p| namespace_from_path(p))
             .transpose()?
             .unwrap_or_else(|| "global".to_string()))
+    }
+
+    /// Nearest project config for `dir` with `namespace_per_worktree`
+    /// enabled, as `(config path, isolated namespace)`. `None` when the
+    /// nearest config does not opt in (or only global config applies).
+    fn nearest_isolated_config(dir: &Path) -> Result<Option<(PathBuf, String)>> {
+        let paths = Self::list_paths_from(dir);
+        let Some(nearest) = paths
+            .iter()
+            .rfind(|p| p.exists()) // most specific (closest) config
+            .filter(|p| !is_global_config(p))
+        else {
+            return Ok(None);
+        };
+        let identity = effective_identity(nearest, None)?;
+        if !identity.namespace_per_worktree {
+            return Ok(None);
+        }
+        let ns = namespace_from_path_with_override(
+            nearest,
+            identity.explicit_namespace.as_deref(),
+            true,
+        )?;
+        Ok(Some((nearest.clone(), ns)))
+    }
+
+    /// Returns the current checkout's namespace when the nearest project
+    /// config for the given directory has `namespace_per_worktree` enabled,
+    /// `None` otherwise (including when only global config applies).
+    ///
+    /// The nearest config decides both whether isolation applies and which
+    /// namespace "local" narrows to, so a worktree nested inside another
+    /// checkout never resolves to its parent's namespace. Traverses the
+    /// filesystem once.
+    pub fn isolated_namespace_for_dir(dir: &Path) -> Result<Option<String>> {
+        Ok(Self::nearest_isolated_config(dir)?.map(|(_, ns)| ns))
+    }
+
+    /// Record the current checkout's namespace → project dir mapping in the
+    /// global `[namespaces]` registry (as `proxy add` does) when the nearest
+    /// config for `dir` has `namespace_per_worktree` enabled.
+    ///
+    /// The supervisor re-resolves daemon configs via its own directory chain
+    /// plus this registry; without an entry, a checkout outside the
+    /// supervisor's chain would silently lose config-driven features (hooks,
+    /// file-watching, autostop). No-op when isolation is off or the entry is
+    /// already current.
+    pub fn register_isolated_namespace_for_dir(dir: &Path) -> Result<()> {
+        let Some((config_path, ns)) = Self::nearest_isolated_config(dir)? else {
+            return Ok(());
+        };
+        let Some(project_dir) = config_project_dir(&config_path) else {
+            return Ok(());
+        };
+        let project_dir = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        // Skip the global-config write when already registered for this dir.
+        let existing = Self::read_global_namespaces();
+        if existing.get(&ns).is_some_and(|e| e.dir == project_dir) {
+            return Ok(());
+        }
+        Self::register_namespace(&ns, &project_dir.to_string_lossy())
     }
 
     /// Convenience method: resolves a single user ID using the merged config and current directory.
@@ -924,6 +1249,7 @@ impl PitchforkToml {
         Self {
             daemons: Default::default(),
             namespace: None,
+            namespace_per_worktree: None,
             settings: SettingsPartial::default(),
             slugs: IndexMap::new(),
             groups: IndexMap::new(),
@@ -944,32 +1270,15 @@ impl PitchforkToml {
             .map_err(|e| ConfigParseError::from_toml_error(path, content.to_string(), e))?;
 
         let namespace = {
-            let base_explicit = sibling_base_config(path)
-                .and_then(|p| if p.exists() { Some(p) } else { None })
-                .map(|p| read_namespace_override_from_file(&p))
-                .transpose()?
-                .flatten();
-
-            if is_local_config(path)
-                && let (Some(local_ns), Some(base_ns)) =
-                    (raw_config.namespace.as_deref(), base_explicit.as_deref())
-                && local_ns != base_ns
-            {
-                return Err(ConfigParseError::InvalidNamespace {
-                    path: path.to_path_buf(),
-                    namespace: local_ns.to_string(),
-                    reason: format!(
-                        "namespace '{local_ns}' does not match sibling pitchfork.toml namespace '{base_ns}'"
-                    ),
-                }
-                .into());
-            }
-
-            let explicit = raw_config.namespace.as_deref().or(base_explicit.as_deref());
-            namespace_from_path_with_override(path, explicit)?
+            let self_overrides = TopLevelOverrides {
+                namespace: raw_config.namespace.clone(),
+                namespace_per_worktree: raw_config.namespace_per_worktree,
+            };
+            resolve_config_namespace(path, Some(&self_overrides))?
         };
         let mut pt = Self::new(path.to_path_buf());
         pt.namespace = raw_config.namespace.clone();
+        pt.namespace_per_worktree = raw_config.namespace_per_worktree;
 
         for (short_name, raw_daemon) in raw_config.daemons {
             let id = match DaemonId::try_new(&namespace, &short_name) {
@@ -1171,12 +1480,17 @@ impl PitchforkToml {
             let config_namespace = if path.exists() {
                 namespace_from_path(path)?
             } else {
-                namespace_from_path_with_override(path, self.namespace.as_deref())?
+                let self_overrides = TopLevelOverrides {
+                    namespace: self.namespace.clone(),
+                    namespace_per_worktree: self.namespace_per_worktree,
+                };
+                resolve_config_namespace(path, Some(&self_overrides))?
             };
 
             // Convert back to raw format for writing (use short names as keys)
             let mut raw = PitchforkTomlRaw {
                 namespace: self.namespace.clone(),
+                namespace_per_worktree: self.namespace_per_worktree,
                 ..PitchforkTomlRaw::default()
             };
             for (id, daemon) in &self.daemons {

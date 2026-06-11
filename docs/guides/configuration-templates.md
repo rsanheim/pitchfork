@@ -60,6 +60,17 @@ The current daemon's own metadata is always available:
 | <code v-pre>{{ id }}</code> | Qualified ID | `"myproj/api"` |
 | <code v-pre>{{ slug }}</code> | Proxy slug alias (or null) | `"myapi"` |
 | <code v-pre>{{ dir }}</code> | Resolved working directory | `"/home/user/myproj"` |
+| <code v-pre>{{ worktree_hash }}</code> | Per-worktree hash suffix (or null) | `"e4c3d83b"` |
+
+With [`namespace_per_worktree`](/concepts/namespaces#per-worktree-namespaces) enabled, `{{ namespace }}` and `{{ id }}` include the per-checkout hash suffix, and <code v-pre>{{ worktree_hash }}</code> exposes the bare suffix. Use it to isolate external resources per checkout:
+
+```toml
+[daemons.api]
+run = "npm run dev"
+env = { DATABASE_NAME = "myapp_{{ worktree_hash }}" }
+```
+
+For projects without `namespace_per_worktree`, <code v-pre>{{ worktree_hash }}</code> is null; use a default for configs that should work both ways: <code v-pre>{{ worktree_hash | default(value="dev") }}</code>.
 
 ### Daemon References
 
@@ -89,6 +100,10 @@ When referencing daemons in a different namespace, use the `namespace.name` key 
 ```
 
 This mirrors the `depends` field, which also supports cross-namespace references like `depends = ["infra/redis"]`.
+
+::: warning
+Qualified keys cannot portably reference a project that uses [`namespace_per_worktree`](/concepts/namespaces#per-worktree-namespaces): its namespace includes a per-checkout hash, so any hardcoded `namespace.name` key only matches one specific checkout.
+:::
 
 ### Settings
 

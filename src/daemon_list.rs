@@ -138,6 +138,10 @@ fn build_placeholder_daemon(
         id: id.clone(),
         status: DaemonStatus::Stopped,
         port: daemon_config.port.clone(),
+        dir: Some(crate::ipc::batch::resolve_daemon_dir(
+            daemon_config.dir.as_deref(),
+            daemon_config.path.as_deref(),
+        )),
         depends: vec![],
         env: None,
         watch: vec![],

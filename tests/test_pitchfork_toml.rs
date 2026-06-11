@@ -2192,3 +2192,377 @@ fn test_namespace_from_home_dot_config_local_is_not_global() {
         "Home .config/pitchfork.local.toml should derive namespace from home directory name"
     );
 }
+
+// ============================================================================
+// namespace_per_worktree tests
+// ============================================================================
+
+/// Helper: create a project dir with a pitchfork.toml and return the toml path.
+fn make_wt_project(temp_dir: &TempDir, rel: &str, content: &str) -> PathBuf {
+    let project_dir = temp_dir.path().join(rel);
+    fs::create_dir_all(&project_dir).unwrap();
+    let toml_path = project_dir.join("pitchfork.toml");
+    fs::write(&toml_path, content).unwrap();
+    toml_path
+}
+
+const WT_CONFIG: &str =
+    "namespace = \"myproj\"\nnamespace_per_worktree = true\n\n[daemons.api]\nrun = \"sleep 1\"\n";
+
+/// With namespace_per_worktree, the namespace is the explicit base plus a
+/// stable 8-hex-char suffix, and derivation is deterministic.
+#[test]
+fn test_namespace_per_worktree_format() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(&temp_dir, "checkout", WT_CONFIG);
+
+    let ns = pitchfork_toml::namespace_from_path(&toml_path).unwrap();
+    let (base, suffix) = ns.split_at("myproj-".len());
+    assert_eq!(base, "myproj-");
+    assert_eq!(suffix.len(), 8);
+    assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // Deterministic across repeated derivations
+    assert_eq!(ns, pitchfork_toml::namespace_from_path(&toml_path).unwrap());
+
+    // Daemons are qualified under the isolated namespace
+    let pt = pitchfork_toml::PitchforkToml::read(&toml_path).unwrap();
+    let id = pt.daemons.keys().next().unwrap();
+    assert_eq!(id.namespace(), ns);
+    assert_eq!(id.name(), "api");
+}
+
+/// Two checkouts of the same project (same committed config, different dirs)
+/// resolve to different namespaces sharing the explicit base — regardless of
+/// what the checkout directories are called.
+#[test]
+fn test_namespace_per_worktree_distinct_checkouts() {
+    let temp_dir = TempDir::new().unwrap();
+    // The colliding-worktree layout (same leaf name) and a branch-named
+    // worktree both get the same treatment.
+    let toml_a = make_wt_project(&temp_dir, "a/myproj", WT_CONFIG);
+    let toml_b = make_wt_project(&temp_dir, "b/myproj", WT_CONFIG);
+    let toml_c = make_wt_project(&temp_dir, "worktrees/fix-bug", WT_CONFIG);
+
+    let ns_a = pitchfork_toml::namespace_from_path(&toml_a).unwrap();
+    let ns_b = pitchfork_toml::namespace_from_path(&toml_b).unwrap();
+    let ns_c = pitchfork_toml::namespace_from_path(&toml_c).unwrap();
+    assert_ne!(ns_a, ns_b);
+    assert_ne!(ns_a, ns_c);
+    assert_ne!(ns_b, ns_c);
+    for ns in [&ns_a, &ns_b, &ns_c] {
+        assert!(ns.starts_with("myproj-"), "got: {ns}");
+    }
+}
+
+/// Enabling the flag without an explicit namespace anywhere is an error.
+#[test]
+fn test_namespace_per_worktree_requires_explicit_namespace() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(
+        &temp_dir,
+        "myproj",
+        "namespace_per_worktree = true\n\n[daemons.api]\nrun = \"sleep 1\"\n",
+    );
+
+    let err = pitchfork_toml::namespace_from_path(&toml_path).unwrap_err();
+    assert!(
+        err.to_string().contains("requires an explicit namespace"),
+        "got: {err}"
+    );
+}
+
+/// Non-ASCII project dirs work since the base comes from the explicit
+/// namespace, not the directory name.
+#[test]
+fn test_namespace_per_worktree_non_ascii_dir() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(
+        &temp_dir,
+        "我的 project",
+        "namespace = \"custom\"\nnamespace_per_worktree = true\n[daemons]\n",
+    );
+
+    let ns = pitchfork_toml::namespace_from_path(&toml_path).unwrap();
+    assert!(
+        ns.starts_with("custom-") && ns.len() == "custom-".len() + 8,
+        "expected custom-<hash8>, got: {ns}"
+    );
+}
+
+/// The hash suffix is FNV-1a over the project dir path and must never change:
+/// daemon identity across pitchfork upgrades depends on it.
+#[test]
+fn test_namespace_per_worktree_golden_hash() {
+    // Nonexistent path: canonicalize falls back to the path as given.
+    let toml_path = Path::new("/pitchfork-wt-golden-test/myproj/pitchfork.toml");
+    let pt = pitchfork_toml::PitchforkToml::parse_str(WT_CONFIG, toml_path).unwrap();
+    let id = pt.daemons.keys().next().unwrap();
+    assert_eq!(id.namespace(), "myproj-4f54e5b4");
+}
+
+/// pitchfork.local.toml without the flag inherits it from the sibling
+/// pitchfork.toml, so both files resolve to the same namespace.
+#[test]
+fn test_namespace_per_worktree_local_toml_inherits() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(&temp_dir, "myproj", WT_CONFIG);
+    let local_path = toml_path.parent().unwrap().join("pitchfork.local.toml");
+    fs::write(&local_path, "[daemons.extra]\nrun = \"sleep 1\"\n").unwrap();
+
+    let ns_base = pitchfork_toml::namespace_from_path(&toml_path).unwrap();
+    let ns_local = pitchfork_toml::namespace_from_path(&local_path).unwrap();
+    assert_eq!(ns_base, ns_local);
+    assert!(ns_base.starts_with("myproj-"));
+}
+
+/// The flag may live only in an untracked pitchfork.local.toml (per-checkout
+/// opt-in) while the namespace stays in the committed pitchfork.toml; both
+/// files resolve to the same isolated namespace.
+#[test]
+fn test_namespace_per_worktree_flag_only_in_local_toml() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(
+        &temp_dir,
+        "myproj",
+        "namespace = \"myproj\"\n\n[daemons.api]\nrun = \"sleep 1\"\n",
+    );
+    let local_path = toml_path.parent().unwrap().join("pitchfork.local.toml");
+    fs::write(&local_path, "namespace_per_worktree = true\n").unwrap();
+
+    let ns_base = pitchfork_toml::namespace_from_path(&toml_path).unwrap();
+    let ns_local = pitchfork_toml::namespace_from_path(&local_path).unwrap();
+    assert_eq!(ns_base, ns_local);
+    assert!(ns_base.starts_with("myproj-"), "got: {ns_base}");
+}
+
+/// With the flag enabled, the namespace may be declared in any sibling config
+/// file — including across the `.config/` boundary.
+#[test]
+fn test_namespace_per_worktree_namespace_in_dot_config_sibling() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("myproj");
+    fs::create_dir_all(project_dir.join(".config")).unwrap();
+    fs::write(
+        project_dir.join(".config/pitchfork.toml"),
+        "namespace = \"myproj\"\n[daemons.db]\nrun = \"sleep 1\"\n",
+    )
+    .unwrap();
+    let toml_path = project_dir.join("pitchfork.toml");
+    fs::write(
+        &toml_path,
+        "namespace_per_worktree = true\n[daemons.api]\nrun = \"sleep 1\"\n",
+    )
+    .unwrap();
+
+    let ns_root = pitchfork_toml::namespace_from_path(&toml_path).unwrap();
+    let ns_dot =
+        pitchfork_toml::namespace_from_path(&project_dir.join(".config/pitchfork.toml")).unwrap();
+    assert_eq!(ns_root, ns_dot);
+    assert!(ns_root.starts_with("myproj-"), "got: {ns_root}");
+}
+
+/// With the flag enabled, divergent explicit namespaces across sibling config
+/// files are an error instead of silently splitting the project.
+#[test]
+fn test_namespace_per_worktree_conflicting_sibling_namespaces() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("myproj");
+    fs::create_dir_all(project_dir.join(".config")).unwrap();
+    fs::write(
+        project_dir.join(".config/pitchfork.toml"),
+        "namespace = \"a\"\n[daemons.db]\nrun = \"sleep 1\"\n",
+    )
+    .unwrap();
+    let toml_path = project_dir.join("pitchfork.toml");
+    fs::write(
+        &toml_path,
+        "namespace = \"b\"\nnamespace_per_worktree = true\n[daemons.api]\nrun = \"sleep 1\"\n",
+    )
+    .unwrap();
+
+    let err = pitchfork_toml::namespace_from_path(&toml_path).unwrap_err();
+    assert!(
+        err.to_string().contains("conflicting namespace values"),
+        "got: {err}"
+    );
+}
+
+/// Conflicting explicit flag values between sibling config files are an error.
+#[test]
+fn test_namespace_per_worktree_conflicting_flags() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(&temp_dir, "myproj", WT_CONFIG);
+    let local_path = toml_path.parent().unwrap().join("pitchfork.local.toml");
+    fs::write(&local_path, "namespace_per_worktree = false\n").unwrap();
+
+    let err = pitchfork_toml::namespace_from_path(&toml_path).unwrap_err();
+    assert!(
+        err.to_string().contains("namespace_per_worktree"),
+        "got: {err}"
+    );
+}
+
+/// A non-boolean value is rejected with a clear error.
+#[test]
+fn test_namespace_per_worktree_must_be_boolean() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(&temp_dir, "myproj", "namespace_per_worktree = \"yes\"\n");
+
+    let err = pitchfork_toml::namespace_from_path(&toml_path).unwrap_err();
+    assert!(
+        err.to_string().contains("namespace_per_worktree"),
+        "got: {err}"
+    );
+}
+
+/// namespace_per_worktree is rejected in global config files.
+#[test]
+fn test_namespace_per_worktree_rejected_in_global_config() {
+    let global_path = &*env::PITCHFORK_GLOBAL_CONFIG_USER;
+    let err =
+        pitchfork_toml::PitchforkToml::parse_str("namespace_per_worktree = true\n", global_path)
+            .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not supported in global config files"),
+        "got: {err}"
+    );
+}
+
+/// namespace_per_worktree round-trips through write().
+#[test]
+fn test_namespace_per_worktree_write_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("myproj");
+    fs::create_dir_all(&project_dir).unwrap();
+    let toml_path = project_dir.join("pitchfork.toml");
+
+    let mut pt = pitchfork_toml::PitchforkToml::new(toml_path.clone());
+    pt.namespace = Some("myproj".to_string());
+    pt.namespace_per_worktree = Some(true);
+    pt.write().unwrap();
+
+    let raw = fs::read_to_string(&toml_path).unwrap();
+    assert!(raw.contains("namespace_per_worktree = true"), "got: {raw}");
+    assert!(raw.contains("namespace = \"myproj\""), "got: {raw}");
+
+    let parsed = pitchfork_toml::PitchforkToml::read(&toml_path).unwrap();
+    assert_eq!(parsed.namespace_per_worktree, Some(true));
+}
+
+/// isolated_namespace_for_dir returns the checkout's namespace only when the
+/// nearest config enables the flag.
+#[test]
+fn test_isolated_namespace_for_dir() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_on = make_wt_project(&temp_dir, "on", WT_CONFIG);
+    let toml_off = make_wt_project(&temp_dir, "off", "[daemons.api]\nrun = \"sleep 1\"\n");
+
+    let dir_on = toml_on.parent().unwrap();
+    let dir_off = toml_off.parent().unwrap();
+
+    let ns = pitchfork_toml::PitchforkToml::isolated_namespace_for_dir(dir_on)
+        .unwrap()
+        .expect("isolated namespace expected");
+    assert_eq!(ns, pitchfork_toml::namespace_from_path(&toml_on).unwrap());
+    assert_eq!(
+        pitchfork_toml::PitchforkToml::isolated_namespace_for_dir(dir_off).unwrap(),
+        None
+    );
+
+    // A subdirectory of an isolated project resolves through the nearest config
+    let sub = dir_on.join("deep/nested");
+    fs::create_dir_all(&sub).unwrap();
+    assert_eq!(
+        pitchfork_toml::PitchforkToml::isolated_namespace_for_dir(&sub).unwrap(),
+        Some(ns)
+    );
+}
+
+// ============================================================================
+// namespace_per_worktree template tests
+// ============================================================================
+
+/// Build a template context for the daemon `name` from a parsed config,
+/// exposing `resolved` daemons (with ports) for cross-daemon references.
+fn wt_template_context(
+    pt: &pitchfork_toml::PitchforkToml,
+    name: &str,
+    resolved: &std::collections::HashMap<DaemonId, Vec<u16>>,
+) -> template::TemplateContext {
+    let (id, config) = pt
+        .daemons
+        .iter()
+        .find(|(id, _)| id.name() == name)
+        .expect("daemon not found in config");
+    template::TemplateContext::new(id, config, resolved, &pt.daemons)
+}
+
+/// {{ id }}, {{ namespace }}, and {{ worktree_hash }} render the hashed
+/// per-worktree values when parsed from an isolated config file.
+#[test]
+fn test_template_renders_per_worktree_namespace() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(&temp_dir, "checkout", WT_CONFIG);
+    let pt = pitchfork_toml::PitchforkToml::read(&toml_path).unwrap();
+    let ns = pitchfork_toml::namespace_from_path(&toml_path).unwrap();
+    let hash = ns.rsplit('-').next().unwrap().to_string();
+
+    let ctx = wt_template_context(&pt, "api", &Default::default());
+    assert_eq!(
+        template::render_template("{{ namespace }}", &ctx).unwrap(),
+        ns
+    );
+    assert_eq!(
+        template::render_template("{{ id }}", &ctx).unwrap(),
+        format!("{ns}/api")
+    );
+    assert_eq!(
+        template::render_template("{{ worktree_hash }}", &ctx).unwrap(),
+        hash
+    );
+}
+
+/// Short-name daemon references resolve between daemons of the same isolated
+/// checkout (they share the hashed namespace).
+#[test]
+fn test_template_short_name_ref_within_isolated_checkout() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(
+        &temp_dir,
+        "checkout",
+        "namespace = \"myproj\"\nnamespace_per_worktree = true\n\n[daemons.api]\nrun = \"sleep 1\"\n\n[daemons.redis]\nrun = \"sleep 1\"\n",
+    );
+    let pt = pitchfork_toml::PitchforkToml::read(&toml_path).unwrap();
+
+    let redis_id = pt
+        .daemons
+        .keys()
+        .find(|id| id.name() == "redis")
+        .unwrap()
+        .clone();
+    let mut resolved = std::collections::HashMap::new();
+    resolved.insert(redis_id, vec![6379]);
+
+    let ctx = wt_template_context(&pt, "api", &resolved);
+    assert_eq!(
+        template::render_template("{{ daemons.redis.port }}", &ctx).unwrap(),
+        "6379"
+    );
+}
+
+/// {{ worktree_hash }} is null (not an undefined-variable error) for daemons
+/// whose project does not use namespace_per_worktree.
+#[test]
+fn test_template_worktree_hash_null_when_not_isolated() {
+    let temp_dir = TempDir::new().unwrap();
+    let toml_path = make_wt_project(&temp_dir, "plain", "[daemons.api]\nrun = \"sleep 1\"\n");
+    let pt = pitchfork_toml::PitchforkToml::read(&toml_path).unwrap();
+
+    let ctx = wt_template_context(&pt, "api", &Default::default());
+    assert_eq!(
+        template::render_template("{{ worktree_hash | default(value=\"none\") }}", &ctx).unwrap(),
+        "none"
+    );
+}

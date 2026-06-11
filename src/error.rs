@@ -265,6 +265,19 @@ pub enum ConfigParseError {
         namespace: String,
         reason: String,
     },
+
+    #[error(
+        "invalid namespace_per_worktree in {}: {reason}",
+        path.display()
+    )]
+    #[diagnostic(
+        code(pitchfork::config::invalid_namespace_per_worktree),
+        url("https://pitchfork.jdx.dev/concepts/namespaces"),
+        help(
+            "namespace_per_worktree = true gives each checkout (e.g. git worktree) its own namespace; it requires an explicit namespace and consistent values across the project's config files"
+        )
+    )]
+    InvalidNamespacePerWorktree { path: PathBuf, reason: String },
 }
 
 impl ConfigParseError {

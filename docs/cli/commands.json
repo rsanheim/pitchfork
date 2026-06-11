@@ -833,7 +833,7 @@
         "full_cmd": [
           "list"
         ],
-        "usage": "list [--hide-header]",
+        "usage": "list [--hide-header] [--dirs]",
         "subcommands": {},
         "args": [],
         "flags": [
@@ -848,12 +848,24 @@
             ],
             "hide": false,
             "global": false
+          },
+          {
+            "name": "dirs",
+            "usage": "--dirs",
+            "help": "Show each daemon's directory (useful with namespace_per_worktree to tell checkouts apart)",
+            "help_first_line": "Show each daemon's directory (useful with namespace_per_worktree to tell checkouts apart)",
+            "short": [],
+            "long": [
+              "dirs"
+            ],
+            "hide": false,
+            "global": false
           }
         ],
         "mounts": [],
         "hide": false,
         "help": "List all daemons",
-        "help_long": "List all daemons\n\nDisplays a table of all tracked daemons with their PIDs, status,\nwhether they are disabled, and any error messages.\n\nThis command shows both:\n- Active daemons (currently running or stopped)\n- Available daemons (defined in config but not yet started)\n\nExample:\n  pitchfork list\n  pitchfork ls                    Alias for 'list'\n  pitchfork list --hide-header    Output without column headers\n\nOutput:\n  Name    PID    Status     Error\n  api     12345  running\n  worker         available\n  db             errored    exit code 127",
+        "help_long": "List all daemons\n\nDisplays a table of all tracked daemons with their PIDs, status,\nwhether they are disabled, and any error messages.\n\nThis command shows both:\n- Active daemons (currently running or stopped)\n- Available daemons (defined in config but not yet started)\n\nExample:\n  pitchfork list\n  pitchfork ls                    Alias for 'list'\n  pitchfork list --hide-header    Output without column headers\n  pitchfork list --dirs           Include each daemon's directory\n\nOutput:\n  Name    PID    Status     Error\n  api     12345  running\n  worker         available\n  db             errored    exit code 127",
         "name": "list",
         "aliases": [
           "ls"
@@ -1025,6 +1037,25 @@
         "aliases": [],
         "hidden_aliases": [],
         "after_help_long": "Examples:\n\n  # Start the MCP server (used by AI assistant tools)\n  $ pitchfork mcp\n\n  # Claude Desktop configuration (claude_desktop_config.json):\n  {\n    \"mcpServers\": {\n      \"pitchfork\": {\n        \"command\": \"pitchfork\",\n        \"args\": [\"mcp\"]\n      }\n    }\n  }\n\n  # Interactive testing with JSON-RPC:\n  $ echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}' | pitchfork mcp\n\n  # Available tools:\n  - pitchfork_status  - List all daemons and their state\n  - pitchfork_start   - Start daemon(s) by name\n  - pitchfork_stop    - Stop daemon(s) by name\n  - pitchfork_restart - Restart daemon(s) by name\n  - pitchfork_logs    - Return recent log output for daemon(s)\n",
+        "examples": []
+      },
+      "namespace": {
+        "full_cmd": [
+          "namespace"
+        ],
+        "usage": "namespace",
+        "subcommands": {},
+        "args": [],
+        "flags": [],
+        "mounts": [],
+        "hide": false,
+        "help": "Print the namespace for the current directory",
+        "help_long": "Print the namespace for the current directory\n\nResolves the nearest pitchfork config file and prints the namespace its\ndaemons belong to. Prints \"global\" when no project config applies.\n\nWith namespace_per_worktree enabled, the output includes the per-worktree\nhash suffix, so it identifies the current checkout.\n\nExample:\n  pitchfork namespace\n  pitchfork stop \"$(pitchfork namespace)/api\"",
+        "name": "namespace",
+        "aliases": [
+          "ns"
+        ],
+        "hidden_aliases": [],
         "examples": []
       },
       "proxy": {

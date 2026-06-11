@@ -21,6 +21,13 @@
         "null"
       ]
     },
+    "namespace_per_worktree": {
+      "description": "Opt-in per-worktree namespace isolation.\n\nWhen `true`, the namespace gains a stable suffix derived from the\nproject directory's canonical path, so every checkout (e.g. git\nworktree) of the project gets its own isolated set of daemons even\nwhen checkouts share the same leaf directory name. Requires an\nexplicit `namespace`; both keys may be declared in any of the\nproject's config files and apply to all of them.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "settings": {
       "description": "Settings configuration (merged from all config files).\n\n**Note:** This field exists for serialization round-trips and for\n`PitchforkToml::merge()` to collect per-file overrides.  It is **not**\nconsumed by the global `settings()` singleton, which is populated\nindependently by `Settings::load()` to avoid a circular dependency\nbetween `PitchforkToml` and `Settings`.  Do not rely on mutations to\nthis field being reflected in `settings()`.",
       "$ref": "#/$defs/SettingsPartial",

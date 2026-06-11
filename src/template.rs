@@ -43,6 +43,9 @@ impl DaemonTemplateState {
 pub struct TemplateContext {
     self_state: DaemonTemplateState,
     daemon_states: HashMap<String, DaemonTemplateState>,
+    /// Per-worktree hash suffix of the daemon's project, when its config has
+    /// `namespace_per_worktree` enabled. `None` otherwise.
+    worktree_hash: Option<String>,
 }
 
 impl TemplateContext {
@@ -105,9 +108,17 @@ impl TemplateContext {
             }
         }
 
+        let worktree_hash = daemon_config.path.as_deref().and_then(|p| {
+            crate::pitchfork_toml::worktree_hash_for_config_path(p).unwrap_or_else(|e| {
+                log::debug!("cannot resolve worktree hash for {}: {e}", p.display());
+                None
+            })
+        });
+
         Self {
             self_state,
             daemon_states,
+            worktree_hash,
         }
     }
 
@@ -150,6 +161,11 @@ impl TemplateContext {
         // via a strict null value instead of an undefined-variable error.
         let proxy_url = build_proxy_url(self.self_state.slug.as_deref(), &s);
         ctx.insert("proxy_url", &proxy_url);
+
+        // Always expose worktree_hash (null when the daemon's project does not
+        // use namespace_per_worktree) so templates can isolate external
+        // resources per checkout with `| default(value=...)` fallbacks.
+        ctx.insert("worktree_hash", &self.worktree_hash);
 
         ctx
     }

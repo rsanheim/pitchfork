@@ -78,6 +78,57 @@ This is useful when:
 
 Qualified IDs are parsed directly and work even when there is no local `pitchfork.toml`.
 
+## Per-Worktree Namespaces
+
+By default, the namespace identifies the *project*, so two checkouts of the same project (e.g. git worktrees) resolve to the same namespace and collide:
+
+```
+~/src/myproj                          # namespace "myproj"
+~/.worktrees/c015/myproj              # also "myproj" — collides!
+```
+
+With a shared namespace the second checkout sees the first checkout's daemons as its own: `pitchfork start` reports them as already running, and `pitchfork stop -l` stops the other checkout's stack.
+
+Set `namespace_per_worktree = true` to give every checkout of the project its own namespace, regardless of where it lives. It requires an explicit `namespace` (the stable cross-checkout base — directory names can't provide one, since a worktree's directory is often named after a branch):
+
+```toml
+namespace = "myproj"
+namespace_per_worktree = true
+
+[daemons.api]
+run = "npm run dev"
+```
+
+The namespace becomes `<namespace>-<hash>`, where `<hash>` is a stable 8-character suffix derived from the checkout's canonical path:
+
+```
+$ cd ~/src/myproj && pitchfork start api
+$ cd ~/.worktrees/c015/myproj && pitchfork start api
+$ pitchfork list --dirs
+myproj-ee0d194f/api  12345  running  ~/src/myproj
+myproj-e4c3d83b/api  12346  running  ~/.worktrees/c015/myproj
+```
+
+Behavior with `namespace_per_worktree` enabled:
+
+- Each checkout gets an isolated set of daemons and logs under one shared supervisor
+- The suffix is stable: the same checkout path always produces the same namespace
+- `start -l` / `stop -l` / `restart -l` narrow to exactly the current checkout's namespace, so a worktree nested *inside* another checkout (e.g. `myproj/.worktrees/feature`) never touches its parent's daemons
+- Short IDs still work: from inside a checkout, `pitchfork start api` resolves to that checkout's daemon
+- `pitchfork namespace` prints the current checkout's namespace; `pitchfork list --dirs` shows which directory each daemon belongs to
+- Both keys may live in any of the project's config files (`pitchfork.toml`, `pitchfork.local.toml`, or the `.config/` variants) and apply to all of them; conflicting values are an error
+- Putting the flag in an untracked `pitchfork.local.toml` opts in a single checkout without committing anything (the committed `namespace` is picked up from `pitchfork.toml`)
+- On `start`, the checkout's namespace is registered in the global `[namespaces]` registry so the supervisor can resolve its config for hooks, file-watching, and autostop
+- In templates, `{{ id }}` and `{{ namespace }}` render the per-checkout values, and `{{ worktree_hash }}` exposes the bare suffix for isolating external resources (database names, socket paths) per checkout — see [Configuration Templates](/guides/configuration-templates)
+
+Caveats:
+
+- Ports are not allocated by namespace: to run the same daemon in several checkouts simultaneously, use `port = { expect = [...], bump = N }` or port `0` so each instance can find a free port
+- The hash is derived from the checkout's path: if you move or rename a checkout while its daemons run, they remain under the old namespace. Stop them by qualified ID from `pitchfork list`, then `pitchfork clean`
+- If the parent checkout opted in only via an untracked `pitchfork.local.toml`, a nested worktree does not inherit the flag (the file isn't part of the checkout) — commit the flag, or opt in each checkout, to get the nested `stop -l` protection
+- Registered `[namespaces]` entries and log directories for deleted checkouts are not garbage-collected
+- Cross-namespace references in committed config (`depends = ["myproj/db"]`, qualified template keys) cannot portably target a per-worktree namespace, since the hash differs per checkout
+
 ## Display Behavior
 
 Pitchfork intelligently shows or hides namespaces in output:
