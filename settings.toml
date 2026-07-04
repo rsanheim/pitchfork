@@ -111,6 +111,31 @@ By default, pitchfork searches well-known locations for the mise binary:
 Set this to an absolute path if mise is installed elsewhere.
 """
 
+[general.shell]
+type = "String"
+env = "PITCHFORK_SHELL"
+default = "sh -c"
+description = "Shell command used to execute daemon run scripts"
+docs = """
+Controls the shell used to execute daemon `run` commands.
+
+The value is split with `shell_words::split` into a program and arguments,
+then the daemon's `run` string is appended verbatim as the final argument
+(passed to the shell's command flag, e.g. `sh -c "<run>"`).
+
+This means the `run` string is interpreted directly by the shell, so
+variable expansion (`$VAR`), globs (`*.txt`), pipes (`|`), and command
+chaining (`&&`) all work as expected.
+
+**Common configurations:**
+- `"sh -c"` — Default, POSIX shell
+- `"sh -o errexit -o pipefail -c"` — Exit on error, fail on pipe failure
+- `"bash -c"` — Use bash instead of sh
+
+When `mise = true` is enabled for a daemon, the shell wraps inside
+`mise x --`, e.g. `mise x -- sh -c "<run>"`.
+"""
+
 [general.startup_log_timestamps]
 type = "Bool"
 env = "PITCHFORK_STARTUP_LOG_TIMESTAMPS"
@@ -147,6 +172,72 @@ this with `line_retention` to enforce both a time limit and a line count limit.
 
 Logs are pruned automatically by the supervisor during its interval watcher
 cycle (no more than once per hour). No manual rotation command is needed.
+"""
+
+[logs.archive_hook]
+# This is a nested group (no "type" field)
+
+[logs.archive_hook.command]
+type = "String"
+env = "PITCHFORK_LOG_ARCHIVE_HOOK_COMMAND"
+default = ""
+description = "Command to run before retention deletes old log entries"
+docs = """
+When set, the given command is invoked before log entries are permanently
+pruned by retention. The command receives the entries about to be deleted as
+JSON Lines (JSONL) on stdin. Each line is an object with the fields:
+
+- `id`: the SQLite row id
+- `daemon_id`: the qualified daemon id (e.g. `"myproject/api"`)
+- `timestamp`: the log timestamp in RFC 3339 format
+- `message`: the raw log message text
+
+The following environment variables are also available:
+
+- `PITCHFORK_DAEMON_ID`: the qualified daemon id
+- `PITCHFORK_ARCHIVE_REASON`: either `"age"` or `"count"`
+
+If the command exits with a non-zero status, the pruning is skipped for that
+batch. This prevents data loss when the archive destination is unavailable.
+
+**Examples:**
+
+```toml
+[logs.archive_hook]
+command = "gzip -c >> /var/log/pitchfork/archive.jsonl.gz"
+```
+
+```toml
+[logs.archive_hook]
+command = "aws s3 cp - s3://my-bucket/pitchfork-logs/"
+```
+"""
+
+[logs.archive_hook.batch_size]
+type = "Integer"
+env = "PITCHFORK_LOG_ARCHIVE_HOOK_BATCH_SIZE"
+default = "1000"
+description = "Maximum log entries per archive hook invocation"
+docs = """
+Log entries selected for pruning are passed to the archive hook in batches of
+this size. Smaller batches use less memory and are easier to retry, while larger
+batches reduce hook invocation overhead.
+"""
+
+[logs.timestamp]
+type = "Bool"
+env = "PITCHFORK_LOG_TIMESTAMP"
+default = "true"
+description = "Show timestamps in log output"
+docs = """
+When enabled (default), pitchfork prefixes each log line with a timestamp
+(e.g. `2024-01-15 10:30:00`).
+
+When disabled, timestamps are omitted from `pitchfork logs` output. This is
+useful when piping logs to tools like `lnav` that expect raw JSON or when
+you want to process log output without the timestamp prefix.
+
+Can be overridden per-invocation with `pitchfork logs --no-timestamp`.
 """
 
 [logs.line_retention]

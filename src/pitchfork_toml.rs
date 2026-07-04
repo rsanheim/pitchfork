@@ -202,6 +202,10 @@ struct PitchforkTomlDaemonRaw {
     /// Overrides the global `settings.logs.line_retention` when set.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub line_retention: Option<i64>,
+    /// Archive hook command invoked before retention prunes this daemon's logs.
+    /// Overrides the global `settings.logs.archive_hook.command` when set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub archive_hook: Option<String>,
 }
 
 /// Configuration schema for pitchfork.toml daemon supervisor configuration files.
@@ -1371,6 +1375,7 @@ impl PitchforkToml {
                 pty: raw_daemon.pty,
                 time_retention: raw_daemon.time_retention,
                 line_retention: raw_daemon.line_retention,
+                archive_hook: raw_daemon.archive_hook,
                 path: Some(path.to_path_buf()),
                 worktree_hash: resolved.worktree_hash.clone(),
             };
@@ -1540,6 +1545,7 @@ impl PitchforkToml {
                     pty: daemon.pty,
                     time_retention: daemon.time_retention.clone(),
                     line_retention: daemon.line_retention,
+                    archive_hook: daemon.archive_hook.clone(),
                 };
                 raw.daemons.insert(id.name().to_string(), raw_daemon);
             }
@@ -1898,6 +1904,9 @@ pub struct PitchforkTomlDaemon {
     /// Maximum number of log entries to keep per daemon.
     /// Overrides the global `settings.logs.line_retention` when set.
     pub line_retention: Option<i64>,
+    /// Archive hook command invoked before retention prunes this daemon's logs.
+    /// Overrides the global `settings.logs.archive_hook.command` when set.
+    pub archive_hook: Option<String>,
     #[schemars(skip)]
     pub path: Option<PathBuf>,
     /// Per-worktree hash suffix of the daemon's project, when its config has
@@ -1938,6 +1947,7 @@ impl PitchforkTomlDaemon {
         RunOptions {
             id: id.clone(),
             cmd,
+            run: Some(self.run.clone()),
             force: false,
             shell_pid: None,
             dir: Dir(dir),
@@ -1968,6 +1978,7 @@ impl PitchforkTomlDaemon {
             memory_limit: self.memory_limit,
             cpu_limit: self.cpu_limit,
             stop_signal: self.stop_signal,
+            archive_hook: self.archive_hook.clone(),
             on_output_hook: self.hooks.as_ref().and_then(|h| h.on_output.clone()),
             pty: self.pty,
         }

@@ -151,6 +151,13 @@
       "description": "Configuration for a single daemon (internal representation with DaemonId)",
       "type": "object",
       "properties": {
+        "archive_hook": {
+          "description": "Archive hook command invoked before retention prunes this daemon's logs.\nOverrides the global `settings.logs.archive_hook.command` when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "auto": {
           "description": "Automatic start/stop behavior based on shell hooks",
           "type": "array",
@@ -594,6 +601,13 @@
             "null"
           ]
         },
+        "shell": {
+          "description": "Shell command used to execute daemon run scripts",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "startup_log_timestamps": {
           "description": "Show timestamps in startup log output",
           "type": [
@@ -652,9 +666,32 @@
         }
       }
     },
+    "SettingsLogsArchiveHookPartial": {
+      "type": "object",
+      "properties": {
+        "batch_size": {
+          "description": "Maximum log entries per archive hook invocation",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "command": {
+          "description": "Command to run before retention deletes old log entries",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "SettingsLogsPartial": {
       "type": "object",
       "properties": {
+        "archive_hook": {
+          "$ref": "#/$defs/SettingsLogsArchiveHookPartial"
+        },
         "line_retention": {
           "description": "Count-based log retention (e.g. 10000)",
           "type": [
@@ -667,6 +704,13 @@
           "description": "Time-based log retention duration (e.g. '7d', '30d')",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "description": "Show timestamps in log output",
+          "type": [
+            "boolean",
             "null"
           ]
         }

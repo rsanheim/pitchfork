@@ -24,11 +24,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: true
           persist-credentials: false
-      - uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           cache: false
       - run: rm -rf .cargo
@@ -53,14 +53,22 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: true
           persist-credentials: false
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          cache: false
       # save-if gates cache writes to main so PRs can only restore, not poison.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # zizmor: ignore[cache-poisoning] v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build UI assets
+        working-directory: ui
+        run: |
+          aube install
+          aube run build
       # `cargo check` (debug) catches the compile errors that otherwise only
       # surface in the release pipeline, without paying for an optimized link.
       # Integration tests under tests/ are Unix-only (lsof, pkill, etc.) so

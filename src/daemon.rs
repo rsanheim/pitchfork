@@ -43,6 +43,9 @@ pub struct Daemon {
     pub dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cmd: Option<Vec<String>>,
+    /// Original shell command string, persisted for retry/watch restarts.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run: Option<String>,
     pub autostop: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cron_schedule: Option<String>,
@@ -117,15 +120,26 @@ pub struct Daemon {
     /// Unix signal to send for graceful shutdown (default: SIGTERM)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub stop_signal: Option<StopConfig>,
+    /// Archive hook command invoked before retention prunes this daemon's logs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub archive_hook: Option<String>,
     /// Allocate a pseudo-terminal for the daemon process.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pty: Option<bool>,
+    /// True for daemons auto-registered from config by the cron watcher,
+    /// not yet started. Treated as "available" by list/status/stats.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_registered: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct RunOptions {
     pub id: DaemonId,
     pub cmd: Vec<String>,
+    /// Original shell command string (from config `run`), passed verbatim to the shell.
+    /// Falls back to joining `cmd` when None (e.g. ad-hoc `pitchfork run -- cmd args`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run: Option<String>,
     pub force: bool,
     pub shell_pid: Option<u32>,
     pub dir: Dir,
@@ -176,6 +190,9 @@ pub struct RunOptions {
     /// Unix signal to send for graceful shutdown (default: SIGTERM)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub stop_signal: Option<StopConfig>,
+    /// Archive hook command invoked before retention prunes this daemon's logs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub archive_hook: Option<String>,
     /// Hook triggered when the daemon produces matching output
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub on_output_hook: Option<crate::pitchfork_toml::OnOutputHook>,
@@ -209,6 +226,7 @@ impl Daemon {
         RunOptions {
             id: self.id.clone(),
             cmd,
+            run: self.run.clone(),
             force: false,
             shell_pid: self.shell_pid,
             dir: Dir(self.dir.clone().unwrap_or_else(|| crate::env::CWD.clone())),
@@ -237,6 +255,7 @@ impl Daemon {
             memory_limit: self.memory_limit,
             cpu_limit: self.cpu_limit,
             stop_signal: self.stop_signal,
+            archive_hook: self.archive_hook.clone(),
             on_output_hook,
             pty: self.pty,
         }

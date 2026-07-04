@@ -1,7 +1,9 @@
+use crate::cli::json_output::{JsonLogEntry, print_json};
 use crate::daemon_id::DaemonId;
 use crate::log_store::sqlite::LOG_STORE;
-use crate::log_store::{LogQuery, LogStore};
+use crate::log_store::{LogQuery, LogStore, MessageFilter};
 use crate::pitchfork_toml::PitchforkToml;
+use crate::settings::settings;
 use crate::state_file::StateFile;
 use crate::ui::style::{edim, estyle, ndim};
 use crate::{Result, env};
@@ -61,6 +63,7 @@ fn format_log_line(
     single_daemon: bool,
     id_width: usize,
     strip_ansi: bool,
+    show_timestamp: bool,
 ) -> String {
     let msg = if strip_ansi {
         console::strip_ansi_codes(msg).to_string()
@@ -68,12 +71,20 @@ fn format_log_line(
         msg.to_string()
     };
     if single_daemon {
-        format!("{} {}", ndim(date), msg)
+        if show_timestamp {
+            format!("{} {}", ndim(date), msg)
+        } else {
+            msg
+        }
     } else {
         let colors_on = !strip_ansi && console::colors_enabled();
         let colored = dimmed_id(id, colors_on);
         let padded = console::pad_str(&colored, id_width, console::Alignment::Left, None);
-        format!("{}  {} {}", padded, ndim(date), msg)
+        if show_timestamp {
+            format!("{}  {} {}", padded, ndim(date), msg)
+        } else {
+            format!("{}  {}", padded, msg)
+        }
     }
 }
 
@@ -189,17 +200,35 @@ pub struct Logs {
     /// Output raw log lines without color or formatting
     #[clap(long)]
     raw: bool,
+
+    /// Output in JSON format
+    #[clap(long, conflicts_with = "raw", conflicts_with = "tail")]
+    json: bool,
+
+    /// Filter logs by case-insensitive substring (can be repeated)
+    ///
+    /// Multiple --grep options are combined with OR.
+    #[clap(long)]
+    grep: Vec<String>,
+
+    /// Filter logs by regular expression
+    #[clap(long)]
+    regex: Option<String>,
+
+    /// Make --grep matching case-sensitive
+    #[clap(long)]
+    case_sensitive: bool,
+
+    /// Omit timestamps from log output
+    #[clap(long)]
+    no_timestamp: bool,
 }
 
 impl Logs {
     pub async fn run(&self) -> Result<()> {
-        // Migrate legacy log directories (old format: "api" → new format: "legacy--api").
-        // This is idempotent and silent so it is safe to run on every invocation.
         migrate_legacy_log_dirs();
 
-        // Resolve user-provided IDs to qualified IDs
         let resolved_ids: Vec<DaemonId> = if self.id.is_empty() {
-            // When no IDs provided, use all daemon IDs
             get_all_daemon_ids()?
         } else {
             PitchforkToml::resolve_ids(&self.id)?
@@ -221,26 +250,69 @@ impl Logs {
             None
         };
 
+        let message_filters = self.build_message_filters()?;
+
+        if self.json {
+            return self.output_json(&resolved_ids, from, to, message_filters);
+        }
+
         let single_daemon = resolved_ids.len() == 1;
-        self.print_existing_logs(&resolved_ids, from, to, single_daemon, self.tail)?;
+        let show_timestamp = settings().logs.timestamp && !self.no_timestamp;
+        let log_lines = self.fetch_log_lines(&resolved_ids, from, to, message_filters.clone())?;
+        let has_time_filter = from.is_some() || to.is_some();
+        self.output_logs(
+            log_lines,
+            single_daemon,
+            has_time_filter,
+            self.tail,
+            show_timestamp,
+        )?;
         if self.tail {
-            tail_logs(&resolved_ids, single_daemon, true).await?;
+            tail_logs(
+                &resolved_ids,
+                single_daemon,
+                true,
+                message_filters,
+                show_timestamp,
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    fn print_existing_logs(
+    fn build_message_filters(&self) -> Result<Vec<MessageFilter>> {
+        if self.case_sensitive && self.grep.is_empty() {
+            warn!("--case-sensitive has no effect without --grep");
+        }
+        let mut filters = Vec::new();
+        for pattern in &self.grep {
+            filters.push(MessageFilter::Contains {
+                pattern: pattern.clone(),
+                case_sensitive: self.case_sensitive,
+            });
+        }
+        if let Some(pattern) = self.regex.as_ref() {
+            // Validate the regex early so the user gets a clear CLI error
+            // instead of a SQLite user-function failure at query time.
+            let _ = regex::Regex::new(pattern)
+                .into_diagnostic()
+                .map_err(|e| miette::miette!("invalid regex pattern: {e}"))?;
+            filters.push(MessageFilter::Regex {
+                pattern: pattern.clone(),
+            });
+        }
+        Ok(filters)
+    }
+
+    fn fetch_log_lines(
         &self,
         resolved_ids: &[DaemonId],
         from: Option<DateTime<Local>>,
         to: Option<DateTime<Local>>,
-        single_daemon: bool,
-        force_no_pager: bool,
-    ) -> Result<()> {
+        message_filters: Vec<MessageFilter>,
+    ) -> Result<Vec<(String, String, String)>> {
         let daemon_ids: Vec<String> = resolved_ids.iter().map(|id| id.qualified()).collect();
-        let id_width = daemon_ids.iter().map(|id| id.len()).max().unwrap_or(0);
-        trace!("log query for: {}", daemon_ids.iter().join(", "));
         let has_time_filter = from.is_some() || to.is_some();
 
         let opts = LogQuery {
@@ -250,6 +322,7 @@ impl Logs {
             limit: if !has_time_filter { self.n } else { None },
             order_desc: !has_time_filter,
             after_id: None,
+            message_filters,
         };
         let entries = LOG_STORE.query(&opts)?;
         let log_lines: Vec<(String, String, String)> = entries
@@ -282,36 +355,60 @@ impl Logs {
             log_lines.into_iter().rev().collect_vec()
         };
 
-        self.output_logs(
-            log_lines,
-            single_daemon,
-            id_width,
-            has_time_filter,
-            self.raw,
-            force_no_pager,
-        )?;
-        Ok(())
+        Ok(log_lines)
+    }
+
+    fn output_json(
+        &self,
+        resolved_ids: &[DaemonId],
+        from: Option<DateTime<Local>>,
+        to: Option<DateTime<Local>>,
+        message_filters: Vec<MessageFilter>,
+    ) -> Result<()> {
+        let log_lines = self.fetch_log_lines(resolved_ids, from, to, message_filters)?;
+
+        let json_entries: Vec<JsonLogEntry> = log_lines
+            .into_iter()
+            .map(|(timestamp, daemon_id, message)| JsonLogEntry {
+                timestamp,
+                daemon_id,
+                message: console::strip_ansi_codes(&message).to_string(),
+            })
+            .collect();
+
+        print_json(&json_entries)
     }
 
     fn output_logs(
         &self,
         log_lines: Vec<(String, String, String)>,
         single_daemon: bool,
-        id_width: usize,
         has_time_filter: bool,
-        raw: bool,
         force_no_pager: bool,
+        show_timestamp: bool,
     ) -> Result<()> {
         if log_lines.is_empty() {
             return Ok(());
         }
 
-        let strip_ansi = raw || !console::colors_enabled();
+        let id_width = log_lines
+            .iter()
+            .map(|(_, id, _)| id.len())
+            .max()
+            .unwrap_or(0);
+        let strip_ansi = self.raw || !console::colors_enabled();
 
-        // Raw mode: output without formatting and without pager
-        if raw {
+        if self.raw {
             for (date, id, msg) in log_lines {
-                let line = format_log_line(&date, &id, &msg, single_daemon, id_width, strip_ansi);
+                let line = format_log_line(
+                    &date,
+                    &id,
+                    &msg,
+                    single_daemon,
+                    id_width,
+                    strip_ansi,
+                    show_timestamp,
+                );
                 println!("{line}");
             }
             return Ok(());
@@ -326,12 +423,21 @@ impl Logs {
                 id_width,
                 has_time_filter,
                 strip_ansi,
+                show_timestamp,
             )?;
         } else {
             for (date, id, msg) in log_lines {
                 println!(
                     "{}",
-                    format_log_line(&date, &id, &msg, single_daemon, id_width, strip_ansi)
+                    format_log_line(
+                        &date,
+                        &id,
+                        &msg,
+                        single_daemon,
+                        id_width,
+                        strip_ansi,
+                        show_timestamp,
+                    )
                 );
             }
         }
@@ -346,6 +452,7 @@ impl Logs {
         id_width: usize,
         has_time_filter: bool,
         strip_ansi: bool,
+        show_timestamp: bool,
     ) -> Result<()> {
         // When time filter is used, start at top; otherwise start at end
         let pager_config = PagerConfig::new(!has_time_filter);
@@ -356,7 +463,15 @@ impl Logs {
                     for (date, id, msg) in log_lines {
                         let line = format!(
                             "{}\n",
-                            format_log_line(&date, &id, &msg, single_daemon, id_width, strip_ansi)
+                            format_log_line(
+                                &date,
+                                &id,
+                                &msg,
+                                single_daemon,
+                                id_width,
+                                strip_ansi,
+                                show_timestamp,
+                            )
                         );
                         if stdin.write_all(line.as_bytes()).is_err() {
                             break;
@@ -368,7 +483,15 @@ impl Logs {
                     for (date, id, msg) in log_lines {
                         println!(
                             "{}",
-                            format_log_line(&date, &id, &msg, single_daemon, id_width, strip_ansi)
+                            format_log_line(
+                                &date,
+                                &id,
+                                &msg,
+                                single_daemon,
+                                id_width,
+                                strip_ansi,
+                                show_timestamp,
+                            )
                         );
                     }
                 }
@@ -378,7 +501,15 @@ impl Logs {
                 for (date, id, msg) in log_lines {
                     println!(
                         "{}",
-                        format_log_line(&date, &id, &msg, single_daemon, id_width, strip_ansi)
+                        format_log_line(
+                            &date,
+                            &id,
+                            &msg,
+                            single_daemon,
+                            id_width,
+                            strip_ansi,
+                            show_timestamp,
+                        )
                     );
                 }
             }
@@ -536,6 +667,8 @@ pub async fn tail_logs(
     names: &[DaemonId],
     single_daemon: bool,
     start_from_end: bool,
+    message_filters: Vec<MessageFilter>,
+    show_timestamp: bool,
 ) -> Result<()> {
     // Poll SQLite log store for new entries since last known row id.
     let id_width = names
@@ -550,17 +683,10 @@ pub async fn tail_logs(
         .iter()
         .map(|id| {
             let since = if start_from_end {
-                match LOG_STORE.query(&LogQuery {
-                    daemon_ids: vec![id.qualified()],
-                    from: None,
-                    to: None,
-                    limit: Some(1),
-                    order_desc: true,
-                    after_id: None,
-                }) {
-                    Ok(entries) => entries.first().map(|e| e.id).unwrap_or(0),
-                    Err(_) => 0,
-                }
+                // Anchor to the last entry overall, not the last filtered entry,
+                // so --tail combined with a filter does not rescan from row 1
+                // on every poll when no message matches yet.
+                LOG_STORE.last_id(id).unwrap_or(None).unwrap_or(0)
             } else {
                 0
             };
@@ -577,14 +703,43 @@ pub async fn tail_logs(
         let mut out = vec![];
         for id in names {
             let after_id = states.get(&id.qualified()).copied();
-            match LOG_STORE.tail(id, after_id) {
+            match LOG_STORE.query(&LogQuery {
+                daemon_ids: vec![id.qualified()],
+                from: None,
+                to: None,
+                limit: None,
+                order_desc: false,
+                after_id,
+                message_filters: message_filters.clone(),
+            }) {
                 Ok(entries) => {
                     for entry in &entries {
                         let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
                         out.push((ts, entry.daemon_id.clone(), entry.message.clone()));
                     }
-                    if let Some(last) = entries.last() {
-                        states.insert(id.qualified(), last.id);
+                    // Advance the cursor past rows already evaluated.
+                    //
+                    // When the query returned entries, entries.last().id is the
+                    // highest row id examined (within the same lock hold as the
+                    // query, so no race with concurrent append_batch). Using it
+                    // directly avoids a separate last_id call that could skip
+                    // matching rows written between the two lock acquisitions.
+                    //
+                    // When the filter is active and no entries matched, fall
+                    // back to last_id to advance past non-matching rows so they
+                    // are not re-evaluated on every poll. The narrow race here
+                    // (a matching row written between query and last_id) is
+                    // accepted as the cost of bounded re-scanning.
+                    let new_cursor = if !entries.is_empty() {
+                        entries.last().map(|e| e.id)
+                    } else if message_filters.is_empty() {
+                        // No filter and no entries: nothing to advance past.
+                        None
+                    } else {
+                        LOG_STORE.last_id(id).ok().flatten()
+                    };
+                    if let Some(last_id) = new_cursor {
+                        states.insert(id.qualified(), last_id);
                     }
                 }
                 Err(e) => {
@@ -601,7 +756,15 @@ pub async fn tail_logs(
             for (date, name, msg) in out {
                 println!(
                     "{}",
-                    format_log_line(&date, &name, &msg, single_daemon, id_width, strip_ansi)
+                    format_log_line(
+                        &date,
+                        &name,
+                        &msg,
+                        single_daemon,
+                        id_width,
+                        strip_ansi,
+                        show_timestamp,
+                    )
                 );
             }
         }
@@ -823,6 +986,7 @@ pub fn collect_startup_logs(
         limit: None,
         order_desc: false,
         after_id: None,
+        message_filters: Vec::new(),
     })?;
     let log_lines = entries
         .into_iter()
@@ -842,7 +1006,6 @@ pub fn collect_startup_logs(
 /// that stops the streaming when sent `true`.
 pub fn stream_startup_logs(
     daemon_id: &DaemonId,
-    from: DateTime<Local>,
     job: std::sync::Arc<clx::progress::ProgressJob>,
 ) -> (
     tokio::sync::watch::Sender<bool>,
@@ -852,6 +1015,21 @@ pub fn stream_startup_logs(
     let id = daemon_id.clone();
 
     let show_ts = crate::settings::settings().general.startup_log_timestamps;
+
+    // Anchor to the daemon's current max log id *synchronously* before
+    // spawning the streaming task. This must happen before ipc.run() starts
+    // the daemon, otherwise early output could be written to the log store
+    // before the anchor is established and get skipped as "already seen".
+    let anchor_id: i64 = LOG_STORE
+        .query(&LogQuery {
+            daemon_ids: vec![id.qualified()],
+            limit: Some(1),
+            order_desc: true,
+            ..Default::default()
+        })
+        .ok()
+        .and_then(|entries| entries.last().map(|e| e.id))
+        .unwrap_or(0);
 
     let handle = tokio::spawn(async move {
         let is_tty = std::io::stderr().is_terminal();
@@ -863,19 +1041,10 @@ pub fn stream_startup_logs(
             edim("•").to_string()
         };
 
-        let mut last_id: i64 = 0;
+        let mut last_id = anchor_id;
 
-        // Initial fetch: all logs since daemon start time
-        let initial_entries = LOG_STORE.query(&LogQuery {
-            daemon_ids: vec![id.qualified()],
-            from: Some(from),
-            to: None,
-            limit: None,
-            order_desc: false,
-            after_id: None,
-        });
-
-        if let Ok(entries) = initial_entries {
+        // Initial fetch: catch any logs already written since the anchor.
+        if let Ok(entries) = LOG_STORE.tail(&id, Some(last_id)) {
             for entry in &entries {
                 let time = entry.timestamp.format("%H:%M:%S").to_string();
                 let msg = strip_pty_controls(&entry.message);

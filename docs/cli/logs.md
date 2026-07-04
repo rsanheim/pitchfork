@@ -68,3 +68,25 @@ Disable pager even in interactive terminal
 ### `--raw`
 
 Output raw log lines without color or formatting
+
+### `--json`
+
+Output in JSON format
+
+### `--grep… <GREP>`
+
+Filter logs by case-insensitive substring (can be repeated)
+
+Multiple --grep options are combined with OR.
+
+### `--regex <REGEX>`
+
+Filter logs by regular expression
+
+### `--case-sensitive`
+
+Make --grep matching case-sensitive
+
+### `--no-timestamp`
+
+Omit timestamps from log output

@@ -25,13 +25,20 @@ jobs:
       tag: ${{ steps.release-plz.outputs.releases && fromJSON(steps.release-plz.outputs.releases)[0].tag || '' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install mise
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - name: Build UI assets
+        working-directory: ui
+        run: |
+          aube install
+          aube run build
       - name: Run release-plz
         id: release-plz
-        uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # v0.5.128
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         with:
           command: release
         env:
@@ -63,11 +70,11 @@ jobs:
     env:
       TAG: ${{ inputs.tag != '' && inputs.tag || needs.release-plz-release.outputs.tag }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
       - run: communique generate "$TAG" --github-release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
@@ -87,9 +94,9 @@ jobs:
 
           ## 💚 Sponsor pitchfork
 
-          pitchfork is built by [@jdx](https://github.com/jdx), who ships developer tools like [mise](https://mise.jdx.dev/), hk, pitchfork, and more. Development is sustained by sponsorships.
+          pitchfork is maintained by [@jdx](https://github.com/jdx), an open source developer for [**entire.io**](https://entire.io), the title sponsor of the [jdx.dev](https://jdx.dev) open source tools including [mise](https://mise.jdx.dev/), [aube](https://aube.jdx.dev/), hk, and more. Development is sustained by sponsorships.
 
-          If pitchfork has a place in your dev workflow, please consider [sponsoring on GitHub](https://github.com/sponsors/jdx). Individual and company sponsorships are what keep the project healthy and moving forward.
+          If pitchfork has a place in your dev workflow, please consider [sponsoring at jdx.dev](https://jdx.dev/sponsors.html). Individual and company sponsorships are what keep the project healthy and moving forward.
           EOF
           } > /tmp/release-notes.md
           gh release edit "$TAG" --notes-file /tmp/release-notes.md
@@ -112,15 +119,20 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Install mise
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - name: Build UI assets
+        working-directory: ui
+        run: |
+          aube install
+          aube run build
       - name: Run release-plz
         id: release-plz
-        uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # v0.5.128
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - name: Install mise
-        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
       - name: Squash generated docs into release PR
         run: |
           PR_BRANCH=$(echo "${STEPS_RELEASE_PLZ_OUTPUTS_PR}" | jq -r '.head_branch // empty')

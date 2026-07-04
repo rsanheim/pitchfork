@@ -5,11 +5,12 @@
 //! - Cron scheduling
 //! - File watching for daemon auto-restart
 
-use super::{SUPERVISOR, Supervisor, interval_duration};
+use super::{SUPERVISOR, Supervisor, UpsertDaemonOpts, interval_duration};
 use crate::daemon_id::DaemonId;
+use crate::daemon_status::DaemonStatus;
 use crate::ipc::IpcResponse;
 use crate::log_store::sqlite::LOG_STORE;
-use crate::log_store::{LogStore, RetentionPolicy};
+use crate::log_store::{ArchiveHook, LogStore, RetentionPolicy};
 use crate::pitchfork_toml::{PitchforkToml, WatchMode};
 use crate::procs::PROCS;
 use crate::settings::settings;
@@ -22,6 +23,18 @@ use std::time::Duration;
 use tokio::time;
 
 type WatchConfig = (DaemonId, Vec<String>, PathBuf, WatchMode);
+
+/// Build an optional archive hook from the configured settings.
+fn build_archive_hook(config: &crate::settings::SettingsLogsArchiveHook) -> Option<ArchiveHook> {
+    let command = config.command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(ArchiveHook {
+        command: command.to_string(),
+        batch_size: config.batch_size.max(1) as usize,
+    })
+}
 
 fn daemon_ids_for_dir(dir: &Path, dir_to_daemons: &HashMap<PathBuf, Vec<DaemonId>>) -> String {
     dir_to_daemons
@@ -332,13 +345,15 @@ impl Supervisor {
             count: global_count,
         };
 
+        let global_archive_hook = build_archive_hook(&settings.logs.archive_hook);
+
         if let Some(w) = global_age_warn {
             warn!("{w}");
         }
 
         // Collect per-daemon overrides from merged config.
         let mut per_daemon_warns: Vec<String> = Vec::new();
-        let per_daemon_policies: Vec<(DaemonId, RetentionPolicy)> = {
+        let per_daemon_policies: Vec<(DaemonId, RetentionPolicy, Option<ArchiveHook>)> = {
             let config = PitchforkToml::all_merged()?;
             config
                 .daemons
@@ -363,7 +378,15 @@ impl Supervisor {
                     let count = d
                         .line_retention
                         .and_then(|n| if n > 0 { Some(n as u64) } else { None });
-                    if age.is_some() || count.is_some() {
+                    let hook = d
+                        .archive_hook
+                        .as_ref()
+                        .filter(|cmd| !cmd.trim().is_empty())
+                        .map(|cmd| ArchiveHook {
+                            command: cmd.clone(),
+                            batch_size: settings.logs.archive_hook.batch_size.max(1) as usize,
+                        });
+                    if age.is_some() || count.is_some() || hook.is_some() {
                         Some((
                             id.clone(),
                             RetentionPolicy {
@@ -381,6 +404,7 @@ impl Supervisor {
                                 }),
                                 count,
                             },
+                            hook,
                         ))
                     } else {
                         None
@@ -397,21 +421,27 @@ impl Supervisor {
         // own per-daemon overrides, so overrides are not silently overwritten.
         let excluded: Vec<DaemonId> = per_daemon_policies
             .iter()
-            .map(|(id, _)| id.clone())
+            .map(|(id, _, _)| id.clone())
             .collect();
 
         // Offload blocking SQLite work to a dedicated thread.
         let total_removed = tokio::task::spawn_blocking(move || {
-            let mut total = LOG_STORE.apply_retention(&global_policy, &excluded)?;
+            let mut total = LOG_STORE.apply_retention(
+                &global_policy,
+                &excluded,
+                global_archive_hook.as_ref(),
+            )?;
 
             // For daemons with per-daemon overrides, apply their specific policy,
             // falling back to the global setting for any dimension they don't override.
-            for (id, policy) in per_daemon_policies {
+            for (id, policy, hook) in per_daemon_policies {
                 let effective_policy = RetentionPolicy {
                     age: policy.age.or(global_policy.age),
                     count: policy.count.or(global_policy.count),
                 };
-                total += LOG_STORE.apply_retention_for_daemon(&id, &effective_policy)?;
+                let effective_hook = hook.as_ref().or(global_archive_hook.as_ref());
+                total +=
+                    LOG_STORE.apply_retention_for_daemon(&id, &effective_policy, effective_hook)?;
             }
 
             Ok::<u64, miette::Error>(total)
@@ -459,10 +489,84 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Register config-only cron daemons into state and remove stale entries.
+    ///
+    /// Daemons defined in config with `cron` but never started are not in
+    /// `state_file.daemons`, so the cron watcher cannot see them. This method
+    /// scans the merged config and upserts any cron daemons that are missing
+    /// from state, marking them with `config_registered = true` so that
+    /// list/status/stats treat them as "available" rather than "stopped".
+    ///
+    /// Also removes stale `config_registered` entries for daemons whose cron
+    /// config has been removed, so they stop firing.
+    async fn register_config_cron_daemons(&self) -> Result<()> {
+        let config = PitchforkToml::all_merged_all_namespaces()?;
+
+        let config_cron_ids: HashSet<&DaemonId> = config
+            .daemons
+            .iter()
+            .filter(|(_, d)| d.cron.is_some())
+            .map(|(id, _)| id)
+            .collect();
+
+        // Remove stale config_registered entries no longer in config.
+        let stale_ids: Vec<DaemonId> = {
+            let state = self.state_file.lock().await;
+            state
+                .daemons
+                .iter()
+                .filter(|(id, d)| d.config_registered && !config_cron_ids.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in &stale_ids {
+            self.remove_daemon(id).await?;
+            info!("removed stale config-only cron daemon {id} from state");
+        }
+
+        // Register config-only cron daemons not yet in state.
+        let to_register: Vec<_> = {
+            let state = self.state_file.lock().await;
+            config
+                .daemons
+                .iter()
+                .filter(|(id, d)| d.cron.is_some() && !state.daemons.contains_key(*id))
+                .collect()
+        };
+
+        for (id, d) in to_register {
+            let cmd = match shell_words::split(&d.run) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    error!("failed to parse command for cron daemon {id}: {e}");
+                    continue;
+                }
+            };
+            let run_opts = d.to_run_options(id, cmd);
+            self.upsert_daemon(
+                UpsertDaemonOpts::from_run_options(&run_opts, DaemonStatus::Stopped)
+                    .set(|o| {
+                        o.config_registered = true;
+                    })
+                    .build(),
+            )
+            .await?;
+            info!("registered config-only cron daemon {id} into state");
+        }
+
+        Ok(())
+    }
+
     /// Check cron schedules and trigger daemons as needed
     pub(crate) async fn check_cron_schedules(&self) -> Result<()> {
         use cron::Schedule;
         use std::str::FromStr;
+
+        // Register config-only cron daemons into state so the cron watcher
+        // can see them. Without this, daemons defined in config with `cron`
+        // but never started (no `boot_start`, no manual `pitchfork start`)
+        // are invisible to the cron checker.
+        self.register_config_cron_daemons().await?;
 
         let now = chrono::Local::now();
 
@@ -559,12 +663,16 @@ impl Supervisor {
                             true
                         }
                         crate::pitchfork_toml::CronRetrigger::Success => {
-                            // Run only if previous command succeeded
-                            daemon.pid.is_none() && daemon.last_exit_success.unwrap_or(false)
+                            // Run if not currently running and the previous run
+                            // succeeded. A never-started daemon (None) is allowed
+                            // to fire its first run.
+                            daemon.pid.is_none() && daemon.last_exit_success.unwrap_or(true)
                         }
                         crate::pitchfork_toml::CronRetrigger::Fail => {
-                            // Run only if previous command failed
-                            daemon.pid.is_none() && !daemon.last_exit_success.unwrap_or(true)
+                            // Run if not currently running and the previous run
+                            // failed. A never-started daemon (None) is allowed
+                            // to fire its first run.
+                            daemon.pid.is_none() && !daemon.last_exit_success.unwrap_or(false)
                         }
                     };
 

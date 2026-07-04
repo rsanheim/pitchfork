@@ -16,15 +16,13 @@ use crate::settings::settings;
 use crate::shell::Shell;
 use crate::supervisor::state::UpsertDaemonOpts;
 use crate::{Result, env};
-use itertools::Itertools;
 use miette::IntoDiagnostic;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::CString;
-use std::iter::once;
-use std::sync::atomic;
+use std::sync::{Arc, atomic};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::select;
@@ -149,7 +147,6 @@ impl Supervisor {
     pub(crate) async fn run_once(&self, opts: RunOptions) -> Result<IpcResponse> {
         let id = &opts.id;
         let original_cmd = opts.cmd.clone(); // Save original command for persistence
-        let cmd = opts.cmd;
 
         // Create channel for readiness notification if wait_ready is true
         let (ready_tx, ready_rx) = if opts.wait_ready {
@@ -250,27 +247,57 @@ impl Supervisor {
             (Vec::new(), opts.ready_port)
         };
 
-        let cmd: Vec<String> = if opts.mise.unwrap_or(settings().general.mise) {
+        // Parse the configured shell (default "sh -c") into program + args.
+        // The run script is passed verbatim as the final argument, avoiding the
+        // lossy split->join round-trip that previously mangled $VAR/glob expansion.
+        let shell_setting = settings().general.shell.clone();
+        let shell_parts = match shell_words::split(&shell_setting) {
+            Ok(parts) if !parts.is_empty() => parts,
+            Ok(_) => {
+                return Ok(IpcResponse::DaemonFailed {
+                    error: "general.shell setting is empty".to_string(),
+                });
+            }
+            Err(e) => {
+                return Ok(IpcResponse::DaemonFailed {
+                    error: format!("failed to parse general.shell setting {shell_setting:?}: {e}"),
+                });
+            }
+        };
+        let (shell_program, shell_args) = shell_parts.split_first().unwrap();
+
+        // Use the original run string verbatim; fall back to joining cmd for
+        // ad-hoc commands (e.g. `pitchfork run -- cmd args`) that have no run string.
+        // We don't prepend `exec` because it breaks compound commands (e.g. `exec a && b`
+        // silently drops `b`). Users can add `exec` themselves in the run string.
+        let run_script = opts
+            .run
+            .clone()
+            .unwrap_or_else(|| shell_words::join(&original_cmd));
+
+        let (program, args) = if opts.mise.unwrap_or(settings().general.mise) {
             match settings().resolve_mise_bin() {
                 Some(mise_bin) => {
                     let mise_bin_str = mise_bin.to_string_lossy().to_string();
                     info!("daemon {id}: wrapping command with mise ({mise_bin_str})");
-                    once("exec".to_string())
-                        .chain(once(mise_bin_str))
-                        .chain(once("x".to_string()))
-                        .chain(once("--".to_string()))
-                        .chain(cmd)
-                        .collect_vec()
+                    let mut args = vec!["x".to_string(), "--".to_string()];
+                    args.push(shell_program.clone());
+                    args.extend(shell_args.iter().cloned());
+                    args.push(run_script);
+                    (mise_bin_str, args)
                 }
                 None => {
                     warn!("daemon {id}: mise=true but mise binary not found, running without mise");
-                    once("exec".to_string()).chain(cmd).collect_vec()
+                    let mut args: Vec<String> = shell_args.to_vec();
+                    args.push(run_script);
+                    (shell_program.clone(), args)
                 }
             }
         } else {
-            once("exec".to_string()).chain(cmd).collect_vec()
+            let mut args: Vec<String> = shell_args.to_vec();
+            args.push(run_script);
+            (shell_program.clone(), args)
         };
-        let args = vec!["-c".to_string(), shell_words::join(&cmd)];
         #[cfg(unix)]
         let run_identity = match resolve_effective_run_identity(opts.user.as_deref()) {
             Ok(identity) => identity,
@@ -280,7 +307,7 @@ impl Supervisor {
                 });
             }
         };
-        info!("run: spawning daemon {id} with args: {args:?}");
+        info!("run: spawning daemon {id} with {program} {args:?}");
 
         // Allocate PTY if configured
         #[cfg(unix)]
@@ -299,7 +326,7 @@ impl Supervisor {
             None
         };
 
-        let mut cmd = tokio::process::Command::new("sh");
+        let mut cmd = tokio::process::Command::new(&program);
 
         #[cfg(unix)]
         if let Some(ref pair) = pty_pair {
@@ -413,40 +440,16 @@ impl Supervisor {
         PROCS.refresh_pids(&[pid]);
         let daemon = self
             .upsert_daemon(
-                UpsertDaemonOpts::builder(id.clone())
+                UpsertDaemonOpts::from_run_options(&opts, DaemonStatus::Running)
                     .set(|o| {
                         o.pid = Some(pid);
-                        o.status = DaemonStatus::Running;
-                        o.shell_pid = opts.shell_pid;
-                        o.dir = Some(opts.dir.0.clone());
                         o.cmd = Some(original_cmd);
-                        o.autostop = opts.autostop;
-                        o.cron_schedule = opts.cron_schedule.clone();
-                        o.cron_retrigger = opts.cron_retrigger;
-                        o.cron_immediate = opts.cron_immediate;
-                        o.retry = Some(opts.retry);
-                        o.retry_count = Some(opts.retry_count);
-                        o.ready_delay = opts.ready_delay;
-                        o.ready_output = opts.ready_output.clone();
-                        o.ready_http = opts.ready_http.clone();
                         o.ready_port = effective_ready_port;
-                        o.ready_cmd = opts.ready_cmd.clone();
                         o.port = crate::config_types::PortConfig::from_parts(
                             expected_ports,
                             opts.port.as_ref().map(|p| p.bump).unwrap_or_default(),
                         );
                         o.resolved_port = resolved_ports;
-                        o.depends = Some(opts.depends.clone());
-                        o.env = opts.env.clone();
-                        o.watch = Some(opts.watch.clone());
-                        o.watch_mode = Some(opts.watch_mode);
-                        o.watch_base_dir = opts.watch_base_dir.clone();
-                        o.mise = opts.mise;
-                        o.user = opts.user.clone();
-                        o.memory_limit = opts.memory_limit;
-                        o.cpu_limit = opts.cpu_limit;
-                        o.stop_signal = opts.stop_signal;
-                        o.pty = opts.pty;
                     })
                     .build(),
             )
@@ -552,8 +555,28 @@ impl Supervisor {
                 // Drop the last sender so the channel closes when all readers finish.
                 drop(output_tx);
             }
-            let log_store = &*LOG_STORE;
+            let log_store = Arc::clone(&LOG_STORE);
             let format_line = |line: String| line;
+
+            const LOG_BATCH_SIZE: usize = 100;
+            const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+            let mut log_buffer: Vec<String> = Vec::with_capacity(LOG_BATCH_SIZE);
+            let mut log_flush_interval = tokio::time::interval(LOG_FLUSH_INTERVAL);
+            log_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let flush_logs = |buffer: &mut Vec<String>| -> Option<tokio::task::JoinHandle<()>> {
+                if buffer.is_empty() {
+                    return None;
+                }
+                let store = Arc::clone(&log_store);
+                let id = id.clone();
+                let batch = std::mem::take(buffer);
+                Some(tokio::task::spawn_blocking(move || {
+                    if let Err(e) = store.append_batch(&id, &batch) {
+                        error!("Failed to write batch to log for daemon {id}: {e}");
+                    }
+                }))
+            };
 
             // SQLite WAL mode provides automatic durability; no explicit flush needed.
 
@@ -692,8 +715,9 @@ impl Supervisor {
                 select! {
                     Some(line) = output_rx.recv() => {
                         let formatted = format_line(line.clone());
-                        if let Err(e) = log_store.append(&id, &formatted) {
-                            error!("Failed to write to log for daemon {id}: {e}");
+                        log_buffer.push(formatted.clone());
+                        if log_buffer.len() >= LOG_BATCH_SIZE {
+                            let _ = flush_logs(&mut log_buffer);
                         }
                         trace!("output: {id} {formatted}");
 
@@ -706,6 +730,13 @@ impl Supervisor {
                             && let Some(ref pattern) = ready_pattern
                             && pattern.is_match(&line_clean)
                         {
+                            // Flush buffered logs synchronously before signalling
+                            // readiness, so collect_startup_logs sees the line
+                            // that triggered the match (and any co-buffered lines)
+                            // in SQLite.
+                            if let Some(handle) = flush_logs(&mut log_buffer) {
+                                let _ = handle.await;
+                            }
                             info!("daemon {id} ready: output matched pattern");
                             ready_notified = true;
                             if let Some(tx) = ready_tx.take() {
@@ -884,7 +915,36 @@ impl Supervisor {
                             detect_and_store_active_port(id.clone(), daemon_pid);
                         }
                     }
+                    _ = log_flush_interval.tick() => {
+                        let _ = flush_logs(&mut log_buffer);
+                    }
                 }
+            }
+
+            // Drain any in-flight output lines that were still in the mpsc
+            // channel or the OS pipe buffer when the child exited. Without
+            // this, trailing log lines from short-lived daemons get dropped.
+            // The reader tasks drop their senders on EOF, so recv() returns
+            // None when all data has been consumed. A total deadline of 5 s
+            // guards against a stuck reader (e.g. PTY master FD not closing)
+            // while ensuring drain doesn't block post-exit cleanup indefinitely.
+            let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= drain_deadline {
+                    break;
+                }
+                let Ok(Some(line)) =
+                    tokio::time::timeout(drain_deadline - now, output_rx.recv()).await
+                else {
+                    break;
+                };
+                log_buffer.push(format_line(line));
+            }
+            // Flush any remaining log lines (including drained) before the process exits.
+            // Await the flush to guarantee all buffered logs are persisted before cleanup.
+            if let Some(handle) = flush_logs(&mut log_buffer) {
+                let _ = handle.await;
             }
 
             // Clear active_port since the process is no longer running
