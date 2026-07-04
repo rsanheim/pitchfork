@@ -1,7 +1,7 @@
 # Worktree Isolation Review — upstream or fork?
 
 *Branch:* `worktree-isolation`
-*Date:* 2026-06-10 (review), 2026-06-11 (design addendum, implementation)
+*Date:* 2026-06-10 (review), 2026-06-11 (design addendum, implementation, cleanup pass)
 *Scope:* Originally review-only; the "Proposed plan" pre-flight checklist is now the implementation work order for this branch. Battle-test the result in a real project before opening the upstream discussion.
 
 ## TL;DR — recommended direction
@@ -58,13 +58,13 @@ What's good:
 * The inline FNV-1a is justified (no hashing code exists in src/ today; std's `DefaultHasher` is unstable across releases; daemon identity depends on hash stability) and the golden-hash test converts the "stable forever" comment into an enforced contract.
 * Tests match house style precisely (banner separators, TempDir, doc-comment-per-test) and cover the right scenarios, including both e2e cases that matter (same-leaf checkouts; nested worktree `stop -l`).
 
-What a maintainer would ask for:
+What a maintainer would ask for (all addressed on the branch as of 2026-06-11):
 
-* Blocking: `docs/public/schema.json` was not regenerated. The schemars field is correct, but `mise run render` was never run — upstream CI asserts render produces no diff, so the PR fails CI as-is. Editor autocomplete also flags the key as unknown until fixed.
-* Blocking: the commit message ("Add opt-in worktree_isolation...") is not conventional-commit format; needs `feat(config): ...` at minimum for the PR title.
-* Consolidate the duplicated parse-whole-TOML-for-one-key machinery (namespace override + worktree_isolation) into one top-level-overrides parser, parsed once per file. The sibling scan currently re-reads and re-parses up to 4 files per config parsed — roughly O(k²) parses per project dir per command. Files are tiny so it's invisible in wall-clock terms, but the codebase's own comments preach computing namespaces once.
-* Fold the `is_global_config` guard into `effective_worktree_isolation` (the same triad is duplicated verbatim at three call sites: src/pitchfork_toml.rs:514-521, 1126-1130, 1337-1341), and reconsider the `self_value: Option<Option<bool>>` parameter (nested Options with subtle semantics).
-* Add a unit test for the global-config rejection path — the one error message asserted nowhere.
+- [x] Blocking: regenerate `docs/public/schema.json` via `mise run render` — done, committed on the branch
+- [x] Blocking: conventional-commit format for commits / PR title (`feat(config): ...`) — done
+- [x] Consolidate the duplicated parse-whole-TOML-for-one-key machinery into one top-level-overrides parser — done (`TopLevelOverrides`). The cleanup pass also removed the worst repeated work: the worktree hash and resolved namespace are computed once at parse time and carried on the parsed structs, so template renders and merges no longer re-scan sibling files from disk
+- [x] Fold the triplicated `is_global_config` guard and drop the `self_value: Option<Option<bool>>` parameter — done; namespace resolution flows through one `resolve_config_namespace` chokepoint, and global configs short-circuit in `sibling_config_paths`
+- [x] Add a unit test for the global-config rejection path — done (`test_namespace_per_worktree_rejected_in_global_config`)
 
 ## Feature interactions (overlap analysis)
 
@@ -89,6 +89,8 @@ Complement, not overlap. Supervisor-side features (autostop, cron, retry, file-w
 | `start -l` can transitively start cross-namespace deps that `stop -l` will never stop | Low | Silent |
 | `-l` semantics become mode-dependent in monorepos (nearest config with the flag excludes ancestor daemons `main` would include) | Low | By design, needs docs |
 | `InvalidWorktreeIsolation` help text ("set worktree_isolation = true") is wrong advice for the conflict and global-config error cases | Low | Cosmetic |
+
+*Status (2026-06-11):* every Medium finding is resolved on the branch — the `-l` narrowing is correct by construction now that sibling namespace agreement is enforced, the local.toml/nested-worktree and moved-checkout traps are documented with a recovery paragraph, the schema is regenerated, and `canonicalize()` failures on existing dirs emit a `warn!`. The help text on the renamed error variant now states the explicit-namespace and sibling-consistency requirements. The remaining Low items are unchanged by choice: broken-sibling TOML fails fast with a clear error, cross-namespace `start -l` deps and monorepo `-l` semantics are documented behavior.
 
 Verified fine (explicitly checked, no issue): hash suffix can never fail namespace validation; FNV-1a implementation is correct (independently recomputed against the golden test); `namespace_for_dir` does return the hashed namespace so the `-l` filter matches; the `self_value` sibling-path matching has no normalization bug; all 9 new unit tests and both e2e tests pass; the 27 failing e2e tests in the wider suite fail identically on `main` (environmental, not ours).
 
@@ -127,6 +129,20 @@ The pre-flight plan below was implemented on this branch. One significant gap wa
 
 Also fixed opportunistically, per the review's "likely maintainer requests": the two single-key TOML parsers were consolidated into one `TopLevelOverrides` parser; the triplicated `is_global_config` guard became one `resolve_config_namespace` chokepoint; the `self_value: Option<Option<bool>>` parameter is gone; `get_local_configured_daemons` does one filesystem traversal instead of two; placeholder (not-yet-started) daemons in `list` now carry their config-resolved dir so `--dirs` works for them.
 
+## Cleanup pass (2026-06-11)
+
+A four-angle review (reuse, simplification, efficiency, altitude) tightened the implementation with no behavior changes; the full suite (545 tests) passes and clippy is clean with `-D warnings`.
+
+* The worktree hash is resolved once at parse time, alongside the namespace, and carried on `PitchforkTomlDaemon.worktree_hash`. Template renders — including supervisor-side hook fires, which previously re-read and re-parsed up to 4 sibling config files per fire — now read a field, and the hash can never disagree with the daemon's own namespace suffix. `worktree_hash_for_config_path` is deleted.
+* `PitchforkToml.resolved_namespace` carries the parse-time namespace, so `all_merged_from` no longer re-derives it from disk (a second full sibling scan per config file).
+* The four project config filenames live in a single `PROJECT_CONFIG_FILENAMES` const shared by `sibling_config_paths` and `list_paths_from`, and the `.config/` grandparent rule has one owner (`config_project_dir`; `ipc::batch::resolve_config_base_dir` delegates to it). Previously the rule existed in three places.
+* `effective_identity` lost its `read_self` closure and `self_seen` bookkeeping (machinery for an unreachable case); the global-config special case moved down into `sibling_config_paths`, collapsing `resolve_config_namespace` to two lines; both sibling-conflict checks now share one `first()` + `find(disagreeing)` idiom.
+* The e2e isolation tests share `start_api` / `assert_stop_local_isolates` helpers, removing ~60 lines of copy-paste.
+
+Reviewed and deliberately kept: `display_dir` in `list.rs` stays inline rather than using `xx::file::display_path`, because `crate::env::HOME_DIR` carries SUDO_USER correction that the xx helper lacks. The inline FNV-1a stays — no equally version-stable hash helper exists in the codebase or deps.
+
+Known residual (accepted): identity resolution still reads sibling files per config file parsed (bounded at 4 tiny TOML files, now cold-path only), and one `pitchfork start --local` walks the directory chain up to three times (local-daemon filter, namespace registration, merge). Milliseconds in practice; a per-project-dir identity cache was judged not worth the complexity. Namespace registration also remains hooked only into the `start_daemons` chokepoint (covers CLI start/restart, TUI, MCP; web `start_daemon` and ad-hoc `run` bypass it) — currently self-masking, worth revisiting if those paths ever reach isolated daemons.
+
 ## Proposed plan
 
 Pre-flight on this branch (before anything goes upstream):
@@ -156,8 +172,8 @@ Then, upstream sequence:
 - [ ] Open an Ideas discussion on jdx/pitchfork framed as the unsolved remainder of #199: directory-name namespaces collide across same-leaf checkouts/worktrees. Reference #448 (worktree-aware proxy) and note this makes its routing key actually disambiguate.
 - [ ] Pre-empt the likely design question in the discussion: why not branch-name suffixes (unstable across branch renames/switches and detached HEAD — daemon identity in the state file can't follow live VCS state the way proxy routing can; charset issues per discussion #297; doesn't cover plain duplicate clones or jj) and why not an env var (CLI/supervisor identity divergence). Pair the hash with the `list` directory column so the readability objection is answered in the same breath
 - [ ] State explicitly that a working implementation with unit + e2e tests exists and you intend to open the PR (preserves authorship against the maintainer-implements-it pattern)
-- [ ] After sign-off (or ~a week of silence with no objection), open the PR; expect the Greptile bot plus possible consolidation requests (single-key parse machinery, `is_global_config` guard fold); iterate within days — the auto-closer is aggressive
-- [ ] Optional sweeteners if asked: consolidate the duplicated parse machinery; per-case help text on the error variant
+- [ ] After sign-off (or ~a week of silence with no objection), open the PR; expect the Greptile bot review; iterate within days — the auto-closer is aggressive (the consolidation requests the review predicted are already done on the branch)
+- [ ] Optional sweetener if asked: per-case help text on the error variant (the help text now covers the requirement/consistency cases; a tailored message per failure mode is the remaining polish)
 
 Fallback to path 1 (personal fork) if upstream declines or demands a redesign you don't want:
 
