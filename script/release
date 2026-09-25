@@ -41,6 +41,8 @@ case "$action" in
       else
         cargo build --locked --profile serious --bin pitchfork --target "$target"
       fi
+      [[ $(git rev-parse HEAD) == "$commit" ]] || die "checkout changed during build"
+      git diff --quiet HEAD || die "tracked files changed during build"
       binary="${CARGO_TARGET_DIR:-target}/$target/serious/pitchfork"
       file "$binary"
       case "$target" in

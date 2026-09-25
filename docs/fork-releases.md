@@ -14,9 +14,9 @@ Use an immutable tag matching `Cargo.toml` plus a fork revision. For example:
 ```sh
 mise run ci-dev
 git push origin chore/fork-binary-releases
-git tag v2.15.0-rsanheim.1 <full-commit-sha>
-git push origin v2.15.0-rsanheim.1
-my-crow pipeline create rsanheim/pitchfork --tag v2.15.0-rsanheim.1
+git tag v2.15.0-rsanheim.2 <full-commit-sha>
+git push origin v2.15.0-rsanheim.2
+my-crow pipeline create rsanheim/pitchfork --tag v2.15.0-rsanheim.2
 ```
 
 A manual **tag** pipeline runs all normal gates and then builds the two Linux
@@ -50,7 +50,7 @@ image. Use a fine-grained GitHub token scoped to `rsanheim/pitchfork` with
 Contents: write. No upstream release-plz or signing secrets are used.
 
 ```sh
-my-crow pipeline create rsanheim/pitchfork --tag v2.15.0-rsanheim.1 \
+my-crow pipeline create rsanheim/pitchfork --tag v2.15.0-rsanheim.2 \
   --var PITCHFORK_PUBLISH=true
 ```
 
@@ -60,20 +60,20 @@ copy the artifact directory from minibox's cache volume to a local directory
 and use your existing authenticated `gh` session from the exact tagged checkout:
 
 ```sh
-PITCHFORK_RELEASE_DIR=/path/to/releases script/release upload v2.15.0-rsanheim.1 linux
+PITCHFORK_RELEASE_DIR=/path/to/releases script/release upload v2.15.0-rsanheim.2 linux
 ```
 
 On a native Apple Silicon Mac, check out the **same tag**, then:
 
 ```sh
-script/release build v2.15.0-rsanheim.1 macos
-script/release upload v2.15.0-rsanheim.1 macos
+script/release build v2.15.0-rsanheim.2 macos
+script/release upload v2.15.0-rsanheim.2 macos
 ```
 
 After checking the artifacts, publish explicitly:
 
 ```sh
-gh release edit v2.15.0-rsanheim.1 --repo rsanheim/pitchfork \
+gh release edit v2.15.0-rsanheim.2 --repo rsanheim/pitchfork \
   --draft=false --prerelease --latest=false
 ```
 
@@ -86,7 +86,7 @@ version (`pitchfork 2.15.0`); the tag's fork revision identifies the distributio
 Replace MeowPlaying's Cargo Git entry with:
 
 ```toml
-"github:rsanheim/pitchfork" = "2.15.0-rsanheim.1"
+"github:rsanheim/pitchfork" = "2.15.0-rsanheim.2"
 ```
 
 Run `mise install` and `mise exec -- pitchfork --version`. The current
