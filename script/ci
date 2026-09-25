@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates curl git file python3 lsof procps netcat-openbsd sudo unzip xz-utils perl
+
+mkdir -p /cache/pitchfork/bin "$CARGO_TARGET_DIR"
+if [[ ! -x /cache/pitchfork/bin/mise ]]; then
+  curl -fsSL https://github.com/jdx/mise/releases/download/v2026.9.12/mise-v2026.9.12-linux-x64.tar.gz \
+    | tar -xz -C /cache/pitchfork/bin --strip-components=2 mise/bin/mise
+fi
+export PATH="/cache/pitchfork/bin:$PATH"
+mise trust
+mise install
+eval "$(mise env -s bash)"
+pnpm config set --global store-dir /cache/pitchfork/pnpm
+# Existing integration tests and render tasks expect target/debug/pitchfork.
+ln -s "$CARGO_TARGET_DIR" target
+mise run --jobs 1 ci
+mise run render
+git diff --exit-code HEAD
+test -z "$(git ls-files --others --exclude-standard)"
+
+# Manual tag builds only. A tag push alone never publishes anything.
+if [[ ${CI_PIPELINE_EVENT:-} == manual && -n ${CI_COMMIT_TAG:-} ]]; then
+  script/release build "$CI_COMMIT_TAG" linux
+fi

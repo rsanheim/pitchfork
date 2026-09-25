@@ -22,7 +22,7 @@ depends = ["lint-fix", "build", "build:docs", "test", "test:web-ui"]
 
 [tasks.docs]
 dir = "docs"
-run = "aube install && exec aube run docs:dev"
+run = "pnpm install && exec pnpm run docs:dev"
 
 [tasks.lint]
 depends = ["build:ui"]
@@ -40,20 +40,20 @@ run = ["cargo build"]
 depends = ["build"]
 dir = "ui"
 run = [
-  "aube install",
-  "if [ \"$(uname -s)\" = \"Linux\" ]; then node_modules/.bin/playwright install --with-deps chromium; else node_modules/.bin/playwright install chromium; fi",
-  "node_modules/.bin/playwright test",
+  "pnpm install --frozen-lockfile",
+  "if [ \"$(uname -s)\" = \"Linux\" ]; then pnpm exec playwright install --with-deps chromium; else pnpm exec playwright install chromium; fi",
+  "pnpm exec playwright test",
 ]
 
 [tasks."build:ui"]
 dir = "ui"
-run = "aube install && exec aube run build && touch ../src/web/static_files.rs"
+run = "pnpm install --frozen-lockfile && pnpm run build && touch ../src/web/static_files.rs"
 sources = ["src/**/*"]
 outputs = ["dist/**/*"]
 
 [tasks."build:docs"]
 dir = "docs"
-run = "aube install && exec aube run docs:build"
+run = "pnpm install --frozen-lockfile && exec pnpm run docs:build"
 
 [tasks.render]
 depends = ["build"]
@@ -81,8 +81,11 @@ bun = "latest" # for tests. FIXME: replace with aube + node
 cargo-binstall = "latest"
 communique = "latest"
 hk = "latest"
-node = "24"
+node = "24.14.0"
+pnpm = "11.10.0"
 pkl = "latest"
 usage = "latest" # for rendering CLI usage
 "cargo:cargo-nextest" = "latest"
-rust = "stable"
+rust = "1.96.0"
+zig = "0.15.2"
+"github:rust-cross/cargo-zigbuild" = "0.23.4"

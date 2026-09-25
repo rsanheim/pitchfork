@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+die() { echo "$*" >&2; exit 1; }
+action=${1:?usage: script/release build|upload TAG linux|macos}
+tag=${2:?release tag required}
+platform=${3:?linux or macos required}
+repo=rsanheim/pitchfork
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+[[ $tag == "v$version-rsanheim."* ]] || die "tag must start with v$version-rsanheim."
+revision=${tag#"v$version-rsanheim."}
+[[ $revision =~ ^[1-9][0-9]*$ ]] || die "fork revision must be a positive integer"
+commit=$(git rev-parse HEAD)
+[[ $(git rev-parse "refs/tags/$tag^{commit}") == "$commit" ]] || die "checkout must match $tag"
+[[ -z ${CI_COMMIT_SHA:-} || $CI_COMMIT_SHA == "$commit" ]] || die "Crow commit differs from checkout"
+git diff --quiet HEAD || die "tracked files must be clean"
+out="${PITCHFORK_RELEASE_DIR:-$PWD/target/releases}/$tag"
+
+case "$platform" in
+  linux) targets=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu) ;;
+  macos) targets=(aarch64-apple-darwin) ;;
+  *) die "only linux and macos are supported" ;;
+esac
+
+case "$action" in
+  build)
+    case "$platform:$(uname -s):$(uname -m)" in
+      linux:Linux:x86_64|macos:Darwin:arm64) ;;
+      *) die "build Linux on native amd64 Linux, or macOS on native arm64 macOS" ;;
+    esac
+    mise install rust node pnpm zig github:rust-cross/cargo-zigbuild
+    eval "$(mise env -s bash)"
+    mise run build:ui
+    mkdir -p "$out"
+    for target in "${targets[@]}"; do
+      started=$SECONDS
+      rustup target add "$target"
+      if [[ $target == aarch64-unknown-linux-gnu ]]; then
+        cargo zigbuild --locked --profile serious --bin pitchfork --target "$target.2.36"
+      else
+        cargo build --locked --profile serious --bin pitchfork --target "$target"
+      fi
+      binary="${CARGO_TARGET_DIR:-target}/$target/serious/pitchfork"
+      file "$binary"
+      case "$target" in
+        x86_64-*) file "$binary" | grep -q 'x86-64' ;;
+        aarch64-unknown-*) file "$binary" | grep -qi aarch64 ;;
+        aarch64-apple-*) file "$binary" | grep -q arm64 ;;
+      esac
+      if [[ $target != aarch64-unknown-linux-gnu ]]; then
+        [[ $("$binary" --version) == "pitchfork $version" ]]
+        "$binary" --help >/dev/null
+        "$binary" schema | grep '"namespace_per_worktree"'
+      fi
+      archive="pitchfork-$target.tar.gz"
+      tar -czf "$out/$archive" -C "$(dirname "$binary")" pitchfork
+      (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
+      printf '%s\n' "$commit" > "$out/pitchfork-$target.commit"
+      echo "$target: $((SECONDS - started)) seconds"
+    done
+    echo "Artifacts: $out"
+    ;;
+  upload)
+    # Resolve the GitHub tag, including annotated tags, before sending assets.
+    remote_commit=$(git ls-remote "https://github.com/$repo.git" "refs/tags/$tag" "refs/tags/$tag^{}" | tail -1 | cut -f1)
+    [[ $remote_commit == "$commit" ]] || die "GitHub tag differs from checkout"
+    assets=()
+    for target in "${targets[@]}"; do
+      [[ $(cat "$out/pitchfork-$target.commit") == "$commit" ]] || die "artifact source differs from tag"
+      (cd "$out" && shasum -a 256 -c "pitchfork-$target.tar.gz.sha256")
+      assets+=("$out/pitchfork-$target.tar.gz" "$out/pitchfork-$target.tar.gz.sha256")
+    done
+    if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+      printf 'Pitchfork %s fork build from commit %s. Includes namespace_per_worktree.\n\nLinux binaries require glibc 2.36 or newer (Debian bookworm).\n' "$version" "$commit" > "$out/notes.md"
+      gh release create "$tag" --repo "$repo" --verify-tag --draft --prerelease \
+        --title "$tag" --notes-file "$out/notes.md"
+    fi
+    # No --clobber: adding the separately built Mac asset is safe; replacing is not.
+    gh release upload "$tag" --repo "$repo" "${assets[@]}"
+    echo "Uploaded. After validation: gh release edit $tag --repo $repo --draft=false --prerelease --latest=false"
+    ;;
+  *) die "expected build or upload" ;;
+esac
