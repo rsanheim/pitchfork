@@ -15,7 +15,6 @@ export PATH="/cache/pitchfork/bin:$PATH"
 mise trust
 mise install
 eval "$(mise env -s bash)"
-pnpm config set --global store-dir /cache/pitchfork/pnpm
 # Existing integration tests and render tasks expect target/debug/pitchfork.
 ln -s "$CARGO_TARGET_DIR" target
 mise run --jobs 1 ci

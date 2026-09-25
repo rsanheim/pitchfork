@@ -17,6 +17,7 @@ variables:
     MISE_CACHE_DIR: /cache/pitchfork/mise-cache
     XDG_CACHE_HOME: /cache/pitchfork/xdg
     PLAYWRIGHT_BROWSERS_PATH: /cache/pitchfork/playwright
+    PNPM_CONFIG_STORE_DIR: /cache/pitchfork/pnpm
     PITCHFORK_RELEASE_DIR: /cache/pitchfork/releases
 
 steps:
